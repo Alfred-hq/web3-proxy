@@ -9,13 +9,12 @@ use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{self, AtomicU32};
+use std::sync::atomic::{self, AtomicBool, AtomicU32};
 use std::{cmp::Ordering, sync::Arc};
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
-use tokio::task;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::app::{flatten_handle, AnyhowJoinHandle};
 
@@ -84,6 +83,8 @@ pub struct Web3Connection {
     hard_limit: Option<redis_cell_client::RedisCellClient>,
     /// used for load balancing to the least loaded server
     soft_limit: u32,
+    /// stop subscriptions
+    pending_shutdown: AtomicBool,
     // TODO: track total number of requests?
 }
 
@@ -161,6 +162,7 @@ impl Web3Connection {
             provider: RwLock::new(Some(Arc::new(provider))),
             hard_limit,
             soft_limit,
+            pending_shutdown: Default::default(),
         };
 
         let connection = Arc::new(connection);
@@ -220,7 +222,13 @@ impl Web3Connection {
         // since this lock is held open over an await, we use tokio's locking
         let mut provider = self.provider.write().await;
 
+        // TODO: should we tell this provider disconnect/shutdown?
         *provider = None;
+
+        if self.pending_shutdown.load(atomic::Ordering::Acquire) {
+            debug!(?self, "pending shutdown. Not reconnecting");
+            return Ok(());
+        }
 
         // tell the block subscriber that we are at 0
         if let Some(block_sender) = block_sender {
@@ -234,6 +242,13 @@ impl Web3Connection {
         let new_provider = Web3Provider::from_str(&self.url, http_client).await?;
 
         *provider = Some(Arc::new(new_provider));
+
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        // we can't wait for a lock on self.provider because subscriptions are holding a read lock on it
+        self.pending_shutdown.store(true, atomic::Ordering::Release);
 
         Ok(())
     }
@@ -367,6 +382,10 @@ impl Web3Connection {
                         // TODO: if error or rate limit, increase interval?
                         http_interval_receiver.recv().await.unwrap();
 
+                        if self.pending_shutdown.load(atomic::Ordering::Acquire) {
+                            break;
+                        }
+
                         match self.try_request_handle().await {
                             Ok(active_request_handle) => {
                                 // TODO: i feel like this should be easier. there is a provider.getBlock, but i don't know how to give it "latest"
@@ -414,10 +433,11 @@ impl Web3Connection {
                     loop {
                         match stream.next().await {
                             Some(new_block) => {
-                                self.send_block(Ok(new_block), &block_sender).await?;
+                                if self.pending_shutdown.load(atomic::Ordering::Acquire) {
+                                    break;
+                                }
 
-                                // TODO: really not sure about this
-                                task::yield_now().await;
+                                self.send_block(Ok(new_block), &block_sender).await?;
                             }
                             None => {
                                 warn!("subscription ended");
@@ -458,6 +478,10 @@ impl Web3Connection {
                         // TODO: if error or rate limit, increase interval?
                         interval.tick().await;
 
+                        if self.pending_shutdown.load(atomic::Ordering::Acquire) {
+                            break;
+                        }
+
                         // TODO: actually do something here
                         /*
                         match self.try_request_handle().await {
@@ -488,6 +512,11 @@ impl Web3Connection {
                     loop {
                         match stream.next().await {
                             Some(pending_tx_id) => {
+                                if self.pending_shutdown.load(atomic::Ordering::Acquire) {
+                                    // TODO: this is going to get loaded a LOT. is that okay?
+                                    break;
+                                }
+
                                 tx_id_sender
                                     .send_async((pending_tx_id, self.clone()))
                                     .await

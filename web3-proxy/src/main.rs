@@ -109,7 +109,7 @@ fn main() -> anyhow::Result<()> {
                 Ok(DebouncedEvent::NoticeRemove(..)) => continue,
                 Ok(event) => {
                     // we don't really care what the event is. most any change and we should probably reload
-                    info!("Updating config! {:?}", event);
+                    info!(?event, "Updating config");
 
                     let new_config: String = fs::read_to_string(cli_path.clone()).unwrap();
 

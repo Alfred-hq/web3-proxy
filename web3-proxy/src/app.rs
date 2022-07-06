@@ -70,7 +70,7 @@ pub async fn flatten_handles<T>(
     Ok(())
 }
 
-// TODO: think more about TxState. d
+// TODO: think more about TxState
 #[derive(Clone)]
 pub enum TxState {
     Pending(Transaction),
@@ -198,13 +198,15 @@ impl Web3ProxyApp {
 
             tokio::spawn(async move {
                 while let Ok(new_config) = config_receiver.recv_async().await {
-                    let new_handles = app.update_config(new_config).await?;
+                    let new_handles = app.update_config(new_config).await.unwrap();
 
                     // TODO: what should we do with this? probably spawn with something to log errors and exit
                     drop(new_handles);
+
+                    info!("configs updated");
                 }
 
-                Ok(())
+                panic!("this shouldn't happen");
             })
         };
 

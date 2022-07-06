@@ -54,9 +54,8 @@ impl SyncedConnections {
 /// A collection of web3 connections. Sends requests either the current best server or all servers.
 #[derive(From)]
 pub struct Web3Connections {
-    // TODO: this is going to need a lock on it
-    inner: HashMap<String, Arc<Web3Connection>>,
-    // TODO: instead of ArcSwap, do a watch channel?
+    // TODO: make use of this being a hashmap. allow removing and updating items
+    inner: ArcSwap<HashMap<String, Arc<Web3Connection>>>,
     synced_connections: ArcSwap<SyncedConnections>,
     pending_transactions: Arc<DashMap<TxHash, TxState>>,
 }
@@ -66,7 +65,9 @@ impl Serialize for Web3Connections {
     where
         S: Serializer,
     {
-        let inner_names: Vec<&str> = self.inner.iter().map(|(x, _)| x.as_ref()).collect();
+        let inner = self.inner.load();
+
+        let inner_names: Vec<&str> = inner.iter().map(|(x, _)| x.as_ref()).collect();
 
         // 3 is the number of fields in the struct.
         let mut state = serializer.serialize_struct("Web3Connections", 2)?;
@@ -78,16 +79,39 @@ impl Serialize for Web3Connections {
 
 impl fmt::Debug for Web3Connections {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.inner.load();
+
+        let inner_names: Vec<&str> = inner.iter().map(|(x, _)| x.as_ref()).collect();
+
         // TODO: the default formatter takes forever to write. this is too quiet though
         f.debug_struct("Web3Connections")
-            .field("inner", &self.inner)
+            .field("rpcs", &inner_names)
             .finish_non_exhaustive()
     }
 }
 
 impl Web3Connections {
-    pub async fn swap_rpcs(&self, new_rpcs: Arc<Self>) -> anyhow::Result<()> {
-        unimplemented!("swap_rpcs");
+    pub async fn swap_rpcs(&self, other_rpcs: Arc<Self>) -> anyhow::Result<()> {
+        let other_inner = other_rpcs.inner.load_full();
+
+        let old_rpcs = self.inner.swap(other_inner);
+
+        other_rpcs.inner.store(old_rpcs);
+
+        // TODO: do something with this handle? we need to handle errors if any
+        tokio::spawn(async move { other_rpcs.shutdown().await });
+
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        let old_rpcs = self.inner.swap(Arc::new(HashMap::new()));
+
+        for rpc in old_rpcs.values() {
+            rpc.shutdown().await.unwrap();
+        }
+
+        Ok(())
     }
 
     pub async fn spawn(
@@ -174,7 +198,7 @@ impl Web3Connections {
         let synced_connections = SyncedConnections::default();
 
         let connections = Arc::new(Self {
-            inner: connections,
+            inner: ArcSwap::from_pointee(connections),
             synced_connections: ArcSwap::new(Arc::new(synced_connections)),
             pending_transactions,
         });
@@ -347,7 +371,6 @@ impl Web3Connections {
         }
 
         info!("subscriptions over: {:?}", self);
-
         Ok(())
     }
 
@@ -425,7 +448,7 @@ impl Web3Connections {
         // TODO: use pending_tx_sender
         pending_tx_sender: Option<broadcast::Sender<TxState>>,
     ) -> anyhow::Result<()> {
-        let total_rpcs = self.inner.len();
+        let total_rpcs = self.inner.load().len();
 
         let mut connection_states = Vec::with_capacity(total_rpcs);
 
@@ -666,7 +689,7 @@ impl Web3Connections {
         // TODO: with capacity?
         let mut selected_rpcs = vec![];
 
-        for (_rpc_name, connection) in self.inner.iter() {
+        for (_rpc_name, connection) in self.inner.load().iter() {
             // check rate limits and increment our connection counter
             match connection.try_request_handle().await {
                 Err(retry_after) => {
@@ -694,7 +717,7 @@ impl Web3Connections {
 
         // TODO: maximum retries?
         loop {
-            if skip_rpcs.len() == self.inner.len() {
+            if skip_rpcs.len() == self.inner.load().len() {
                 break;
             }
             match self.next_upstream_server(&skip_rpcs).await {

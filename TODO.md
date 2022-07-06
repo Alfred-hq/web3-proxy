@@ -85,3 +85,4 @@
 - [ ] use https://github.com/ledgerwatch/interfaces to talk to erigon directly instead of through erigon's rpcdaemon (possible example code which uses ledgerwatch/interfaces: https://github.com/akula-bft/akula/tree/master)
 - [ ] subscribe to pending transactions and build an intelligent gas estimator
 - [ ] include private rpcs with regular queries? i don't want to overwhelm them, but they could be good for excess load
+- [ ] initial connections should happen in parallel
