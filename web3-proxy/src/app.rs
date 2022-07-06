@@ -7,12 +7,12 @@ use futures::future::Abortable;
 use futures::future::{join_all, AbortHandle};
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
-use futures::Future;
 use linkedhashmap::LinkedHashMap;
 use parking_lot::RwLock;
+use redis_cell_client::MultiplexedConnection;
 use serde_json::json;
+use std::collections::HashMap;
 use std::fmt;
-use std::pin::Pin;
 use std::sync::atomic::{self, AtomicUsize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +22,7 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
 use tracing::{debug, info, info_span, instrument, trace, warn, Instrument};
 
-use crate::config::Web3ConnectionConfig;
+use crate::config::{RpcConfig, Web3ConnectionConfig};
 use crate::connections::Web3Connections;
 use crate::jsonrpc::JsonRpcForwardedResponse;
 use crate::jsonrpc::JsonRpcForwardedResponseEnum;
@@ -83,17 +83,21 @@ pub enum TxState {
 // TODO: if Web3ProxyApp is always in an Arc, i think we can avoid having at least some of these internal things in arcs
 // TODO: i'm sure this is more arcs than necessary, but spawning futures makes references hard
 pub struct Web3ProxyApp {
+    chain_id: usize,
+    http_client: Option<reqwest::Client>,
+    rate_limiter_conn: Option<MultiplexedConnection>,
     /// Send requests to the best server available
     balanced_rpcs: Arc<Web3Connections>,
     /// Send private requests (like eth_sendRawTransaction) to all these servers
     private_rpcs: Arc<Web3Connections>,
+    // TODO: move this into redis?
     incoming_requests: ActiveRequestsMap,
+    // TODO: move this into redis?
     response_cache: ResponseLrcCache,
-    // don't drop this or the sender will stop working
-    // TODO: broadcast channel instead?
     head_block_receiver: watch::Receiver<Block<TxHash>>,
     pending_tx_sender: broadcast::Sender<TxState>,
     pending_transactions: Arc<DashMap<TxHash, TxState>>,
+    // next_subscription_id should be per connection and not per app
     next_subscription_id: AtomicUsize,
 }
 
@@ -109,16 +113,116 @@ impl Web3ProxyApp {
         &self.pending_transactions
     }
 
+    pub async fn update_config(
+        &self,
+        new_config: RpcConfig,
+    ) -> anyhow::Result<FuturesUnordered<JoinHandle<anyhow::Result<()>>>> {
+        // TODO: save these handles somewhere else instead?
+        let handles = FuturesUnordered::new();
+
+        // let mut new_balanced_rpcs: Vec<(String, Web3ConnectionConfig)> = vec![];
+        // let mut old_balanced_rpcs: Vec<String> = vec![];
+
+        // do not allow the chain id to change
+        if new_config.shared.chain_id != self.chain_id {
+            return Err(anyhow::anyhow!("cannot change chain id!"));
+        }
+
+        // TODO: allow changing the redis address or other shared config?
+
+        // TODO: create new connections
+        // TODO: attach context to this error
+        let (balanced_rpcs, balanced_handle) = Web3Connections::spawn(
+            self.chain_id,
+            self.http_client.as_ref(),
+            self.rate_limiter_conn.as_ref(),
+            None,
+            Some(self.pending_tx_sender.clone()),
+            self.pending_transactions.clone(),
+            new_config.balanced_rpcs,
+        )
+        .await?;
+
+        handles.push(balanced_handle);
+
+        let private_rpcs = if new_config.private_rpcs.is_empty() {
+            info!("No private relays configured. Any transactions will be broadcast to the public mempool!");
+            balanced_rpcs.clone()
+        } else {
+            // TODO: attach context to this error
+            let (private_rpcs, private_handle) = Web3Connections::spawn(
+                self.chain_id,
+                self.http_client.as_ref(),
+                self.rate_limiter_conn.as_ref(),
+                // subscribing to new heads here won't work well
+                None,
+                // TODO: subscribe to pending transactions on the private rpcs?
+                Some(self.pending_tx_sender.clone()),
+                self.pending_transactions.clone(),
+                new_config.private_rpcs,
+            )
+            .await?;
+
+            handles.push(private_handle);
+
+            private_rpcs
+        };
+
+        // swap the connections. self.balanced_rpcs owns head_block_sender
+        self.balanced_rpcs.swap_rpcs(balanced_rpcs).await?;
+        self.private_rpcs.swap_rpcs(private_rpcs).await?;
+
+        // TODO: what do we do with the handles? we need to error if any of them error
+        Ok(handles)
+    }
+
+    pub async fn spawn_with_watched_config(
+        config_receiver: flume::Receiver<RpcConfig>,
+    ) -> anyhow::Result<(
+        Arc<Web3ProxyApp>,
+        FuturesUnordered<JoinHandle<anyhow::Result<()>>>,
+    )> {
+        // there should already be a config ready for the receiver
+        let first_config = config_receiver.try_recv()?;
+
+        let (app, app_handles) = Web3ProxyApp::spawn(
+            first_config.shared.chain_id,
+            first_config.shared.rate_limit_redis,
+            first_config.balanced_rpcs,
+            first_config.private_rpcs,
+        )
+        .await?;
+
+        let config_handle = {
+            let app = app.clone();
+
+            tokio::spawn(async move {
+                while let Ok(new_config) = config_receiver.recv_async().await {
+                    let new_handles = app.update_config(new_config).await?;
+
+                    // TODO: what should we do with this? probably spawn with something to log errors and exit
+                    drop(new_handles);
+                }
+
+                Ok(())
+            })
+        };
+
+        app_handles.push(config_handle);
+
+        Ok((app, app_handles))
+    }
+
     pub async fn spawn(
         chain_id: usize,
         redis_address: Option<String>,
-        balanced_rpcs: Vec<Web3ConnectionConfig>,
-        private_rpcs: Vec<Web3ConnectionConfig>,
+        balanced_rpcs: HashMap<String, Web3ConnectionConfig>,
+        private_rpcs: HashMap<String, Web3ConnectionConfig>,
     ) -> anyhow::Result<(
         Arc<Web3ProxyApp>,
-        Pin<Box<dyn Future<Output = anyhow::Result<()>>>>,
+        FuturesUnordered<JoinHandle<anyhow::Result<()>>>,
     )> {
-        // TODO: try_join_all instead
+        // TODO: save these handles somewhere else instead?
         let handles = FuturesUnordered::new();
 
         // make a http shared client
@@ -132,7 +236,7 @@ impl Web3ProxyApp {
                 .build()?,
         );
 
-        let rate_limiter = match redis_address {
+        let rate_limiter_conn = match redis_address {
             Some(redis_address) => {
                 info!("Connecting to redis on {}", redis_address);
                 let redis_client = redis_cell_client::Client::open(redis_address)?;
@@ -162,12 +266,12 @@ impl Web3ProxyApp {
         // TODO: attach context to this error
         let (balanced_rpcs, balanced_handle) = Web3Connections::spawn(
             chain_id,
-            balanced_rpcs,
             http_client.as_ref(),
-            rate_limiter.as_ref(),
+            rate_limiter_conn.as_ref(),
             Some(head_block_sender),
             Some(pending_tx_sender.clone()),
             pending_transactions.clone(),
+            balanced_rpcs,
         )
         .await?;
 
@@ -180,14 +284,14 @@ impl Web3ProxyApp {
             // TODO: attach context to this error
             let (private_rpcs, private_handle) = Web3Connections::spawn(
                 chain_id,
-                private_rpcs,
                 http_client.as_ref(),
-                rate_limiter.as_ref(),
+                rate_limiter_conn.as_ref(),
                 // subscribing to new heads here won't work well
                 None,
                 // TODO: subscribe to pending transactions on the private rpcs?
                 Some(pending_tx_sender.clone()),
                 pending_transactions.clone(),
+                private_rpcs,
             )
             .await?;
 
@@ -199,7 +303,10 @@ impl Web3ProxyApp {
         // TODO: use this? it could listen for confirmed transactions and then clear pending_transactions, but the head_block_sender is doing that
         drop(pending_tx_receiver);
 
-        let app = Web3ProxyApp {
+        let app = Self {
+            chain_id,
+            http_client,
+            rate_limiter_conn,
             balanced_rpcs,
             private_rpcs,
             incoming_requests: Default::default(),
@@ -212,11 +319,7 @@ impl Web3ProxyApp {
 
         let app = Arc::new(app);
 
-        // create a handle that returns on the first error
-        // TODO: move this to a helper. i think Web3Connections needs it too
-        let handle = Box::pin(flatten_handles(handles));
-
-        Ok((app, handle))
+        Ok((app, handles))
     }
 
     pub async fn eth_subscribe(

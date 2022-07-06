@@ -73,6 +73,7 @@ impl fmt::Debug for Web3Provider {
 
 /// An active connection to a Web3Rpc
 pub struct Web3Connection {
+    name: String,
     /// TODO: can we get this from the provider? do we even need it?
     url: String,
     /// keep track of currently open requests. We sort on this
@@ -110,14 +111,14 @@ impl Serialize for Web3Connection {
 impl fmt::Debug for Web3Connection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Web3Connection")
-            .field("url", &self.url)
+            .field("name", &self.name)
             .finish_non_exhaustive()
     }
 }
 
 impl fmt::Display for Web3Connection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.url)
+        write!(f, "{}", &self.name)
     }
 }
 
@@ -127,6 +128,7 @@ impl Web3Connection {
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         chain_id: usize,
+        name: String,
         url_str: String,
         // optional because this is only used for http providers. websocket providers don't use it
         http_client: Option<&reqwest::Client>,
@@ -153,6 +155,7 @@ impl Web3Connection {
         let provider = Web3Provider::from_str(&url_str, http_client).await?;
 
         let connection = Self {
+            name,
             url: url_str.clone(),
             active_requests: 0.into(),
             provider: RwLock::new(Some(Arc::new(provider))),
@@ -238,6 +241,10 @@ impl Web3Connection {
     #[inline]
     pub fn active_requests(&self) -> u32 {
         self.active_requests.load(atomic::Ordering::Acquire)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     #[inline]
@@ -435,7 +442,7 @@ impl Web3Connection {
         // TODO: is a RwLock of an Option<Arc> the right thing here?
         if let Some(provider) = self.provider.read().await.clone() {
             match &*provider {
-                Web3Provider::Http(provider) => {
+                Web3Provider::Http(_provider) => {
                     // there is a "watch_pending_transactions" function, but a lot of public nodes do not support the necessary rpc endpoints
                     // TODO: what should this interval be? probably automatically set to some fraction of block time
                     // TODO: maybe it would be better to have one interval for all of the http providers, but this works for now
@@ -470,8 +477,6 @@ impl Web3Connection {
                     let active_request_handle = self.wait_for_request_handle().await;
 
                     // TODO: automatically reconnect?
-                    // TODO: it would be faster to get the block number, but subscriptions don't provide that
-                    // TODO: maybe we can do provider.subscribe("newHeads") and then parse into a custom struct that only gets the number out?
                     let mut stream = provider.subscribe_pending_txs().await?;
 
                     drop(active_request_handle);

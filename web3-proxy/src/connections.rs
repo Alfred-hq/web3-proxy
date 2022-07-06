@@ -8,11 +8,11 @@ use ethers::prelude::{Block, ProviderError, Transaction, TxHash, H256};
 use futures::future::try_join_all;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use hashbrown::HashMap;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use std::cmp;
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -54,7 +54,9 @@ impl SyncedConnections {
 /// A collection of web3 connections. Sends requests either the current best server or all servers.
 #[derive(From)]
 pub struct Web3Connections {
-    inner: Vec<Arc<Web3Connection>>,
+    // TODO: this is going to need a lock on it
+    inner: HashMap<String, Arc<Web3Connection>>,
+    // TODO: instead of ArcSwap, do a watch channel?
     synced_connections: ArcSwap<SyncedConnections>,
     pending_transactions: Arc<DashMap<TxHash, TxState>>,
 }
@@ -64,11 +66,11 @@ impl Serialize for Web3Connections {
     where
         S: Serializer,
     {
-        let inner: Vec<&Web3Connection> = self.inner.iter().map(|x| x.as_ref()).collect();
+        let inner_names: Vec<&str> = self.inner.iter().map(|(x, _)| x.as_ref()).collect();
 
         // 3 is the number of fields in the struct.
         let mut state = serializer.serialize_struct("Web3Connections", 2)?;
-        state.serialize_field("rpcs", &inner)?;
+        state.serialize_field("rpcs", &inner_names)?;
         state.serialize_field("synced_connections", &**self.synced_connections.load())?;
         state.end()
     }
@@ -84,15 +86,18 @@ impl fmt::Debug for Web3Connections {
 }
 
 impl Web3Connections {
-    // #[instrument(name = "spawn_Web3Connections", skip_all)]
+    pub async fn swap_rpcs(&self, new_rpcs: Arc<Self>) -> anyhow::Result<()> {
+        unimplemented!("swap_rpcs");
+    }
+
     pub async fn spawn(
         chain_id: usize,
-        server_configs: Vec<Web3ConnectionConfig>,
         http_client: Option<&reqwest::Client>,
-        rate_limiter: Option<&redis_cell_client::MultiplexedConnection>,
+        rate_limiter_conn: Option<&redis_cell_client::MultiplexedConnection>,
         head_block_sender: Option<watch::Sender<Block<TxHash>>>,
         pending_tx_sender: Option<broadcast::Sender<TxState>>,
         pending_transactions: Arc<DashMap<TxHash, TxState>>,
+        server_configs: HashMap<String, Web3ConnectionConfig>,
     ) -> anyhow::Result<(Arc<Self>, AnyhowJoinHandle<()>)> {
         let num_connections = server_configs.len();
 
@@ -137,25 +142,27 @@ impl Web3Connections {
         };
 
         // turn configs into connections
-        let mut connections = Vec::with_capacity(num_connections);
-        for server_config in server_configs.into_iter() {
+        let mut connections = HashMap::with_capacity(num_connections);
+        for (server_name, server_config) in server_configs.into_iter() {
             match server_config
                 .spawn(
-                    rate_limiter,
+                    Some(block_sender.clone()),
                     chain_id,
+                    server_name.clone(),
                     http_client,
                     http_interval_sender.clone(),
-                    Some(block_sender.clone()),
+                    rate_limiter_conn,
                     Some(pending_tx_id_sender.clone()),
                 )
                 .await
             {
                 Ok((connection, connection_handle)) => {
                     handles.push(flatten_handle(connection_handle));
-                    connections.push(connection)
+                    connections.insert(server_name, connection);
                 }
                 // TODO: include the server url in this
-                Err(e) => warn!("Unable to connect to a server! {:?}", e),
+                // TODO: spawn a thread to retry (depending on the error)
+                Err(e) => warn!("Unable to connect to {}! {:?}", server_name, e),
             }
         }
 
@@ -175,8 +182,8 @@ impl Web3Connections {
         let handle = {
             let connections = connections.clone();
 
+            // TODO: select between this and try_join_all(handles)?
             tokio::spawn(async move {
-                // TODO: try_join_all with the other handles here
                 connections
                     .subscribe(
                         pending_tx_id_receiver,
@@ -420,8 +427,7 @@ impl Web3Connections {
     ) -> anyhow::Result<()> {
         let total_rpcs = self.inner.len();
 
-        let mut connection_states: HashMap<Arc<Web3Connection>, _> =
-            HashMap::with_capacity(total_rpcs);
+        let mut connection_states = Vec::with_capacity(total_rpcs);
 
         let mut pending_synced_connections = SyncedConnections::default();
 
@@ -451,7 +457,7 @@ impl Web3Connections {
                 warn!("still syncing");
             }
 
-            connection_states.insert(rpc.clone(), (new_block_num, new_block_hash));
+            connection_states.push((rpc.clone(), new_block_num, new_block_hash));
 
             // TODO: do something to update the synced blocks
             match new_block_num.cmp(&pending_synced_connections.head_block_num) {
@@ -492,7 +498,7 @@ impl Web3Connections {
 
                         let mut counted_rpcs = 0;
 
-                        for (rpc, (block_num, block_hash)) in connection_states.iter() {
+                        for (rpc, block_num, block_hash) in connection_states.iter() {
                             if *block_num != new_block_num {
                                 // this connection isn't synced. we don't care what hash it has
                                 continue;
@@ -607,7 +613,7 @@ impl Web3Connections {
             return Err(None);
         }
 
-        let sort_cache: HashMap<Arc<Web3Connection>, (f32, u32)> = synced_rpcs
+        let sort_cache: HashMap<String, (f32, u32)> = synced_rpcs
             .iter()
             .map(|rpc| {
                 let active_requests = rpc.active_requests();
@@ -615,13 +621,13 @@ impl Web3Connections {
 
                 let utilization = active_requests as f32 / soft_limit as f32;
 
-                (rpc.clone(), (utilization, soft_limit))
+                (rpc.name().to_string(), (utilization, soft_limit))
             })
             .collect();
 
         synced_rpcs.sort_unstable_by(|a, b| {
-            let (a_utilization, a_soft_limit) = sort_cache.get(a).unwrap();
-            let (b_utilization, b_soft_limit) = sort_cache.get(b).unwrap();
+            let (a_utilization, a_soft_limit) = sort_cache.get(a.name()).unwrap();
+            let (b_utilization, b_soft_limit) = sort_cache.get(b.name()).unwrap();
 
             // TODO: i'm comparing floats. crap
             match a_utilization
@@ -660,7 +666,7 @@ impl Web3Connections {
         // TODO: with capacity?
         let mut selected_rpcs = vec![];
 
-        for connection in self.inner.iter() {
+        for (_rpc_name, connection) in self.inner.iter() {
             // check rate limits and increment our connection counter
             match connection.try_request_handle().await {
                 Err(retry_after) => {

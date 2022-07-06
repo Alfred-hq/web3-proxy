@@ -7,16 +7,17 @@ mod connections;
 mod frontend;
 mod jsonrpc;
 
+use notify::{DebouncedEvent, Watcher};
 use parking_lot::deadlock;
 use std::fs;
 use std::sync::atomic::{self, AtomicUsize};
 use std::thread;
 use std::time::Duration;
 use tokio::runtime;
-use tracing::{info, trace};
+use tracing::{error, info, trace};
 use tracing_subscriber::EnvFilter;
 
-use crate::app::{flatten_handle, Web3ProxyApp};
+use crate::app::{flatten_handle, flatten_handles, Web3ProxyApp};
 use crate::config::{CliConfig, RpcConfig};
 
 fn main() -> anyhow::Result<()> {
@@ -37,7 +38,8 @@ fn main() -> anyhow::Result<()> {
     let cli_config: CliConfig = argh::from_env();
 
     info!("Loading rpc config @ {}", cli_config.config);
-    let rpc_config: String = fs::read_to_string(cli_config.config)?;
+    let rpc_config: String = fs::read_to_string(cli_config.config.clone())?;
+
     let rpc_config: RpcConfig = toml::from_str(&rpc_config)?;
 
     trace!("rpc_config: {:?}", rpc_config);
@@ -64,6 +66,7 @@ fn main() -> anyhow::Result<()> {
     let rt = rt_builder.build()?;
 
     // spawn a thread for deadlock detection
+    #[cfg(feature = "deadlock_detection")]
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(10));
         let deadlocks = deadlock::check_deadlock();
@@ -71,25 +74,63 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        println!("{} deadlocks detected", deadlocks.len());
+        eprintln!("{} deadlocks detected", deadlocks.len());
         for (i, threads) in deadlocks.iter().enumerate() {
-            println!("Deadlock #{}", i);
+            eprintln!("Deadlock #{}", i);
             for t in threads {
-                println!("Thread Id {:#?}", t.thread_id());
-                println!("{:#?}", t.backtrace());
+                eprintln!("Thread Id {:#?}", t.thread_id());
+                eprintln!("{:#?}", t.backtrace());
+            }
+        }
+    });
+
+    // setup a channel for watching the config. it needs an initial value
+    let (config_sender, config_receiver) = flume::unbounded();
+    config_sender.send(rpc_config)?;
+
+    // spawn the thread for watching the config
+    let cli_path = cli_config.config.clone();
+    thread::spawn(move || loop {
+        // Create a watcher object, delivering debounced events.
+        let (tx, rx) = std::sync::mpsc::channel();
+        // TODO: what duration?
+        let mut watcher = notify::watcher(tx, Duration::from_secs(1)).unwrap();
+
+        watcher
+            .watch(cli_path.clone(), notify::RecursiveMode::NonRecursive)
+            .unwrap();
+
+        loop {
+            match rx.recv() {
+                Ok(DebouncedEvent::Error(..)) => {
+                    unimplemented!();
+                }
+                Ok(DebouncedEvent::NoticeWrite(..)) => continue,
+                Ok(DebouncedEvent::NoticeRemove(..)) => continue,
+                Ok(event) => {
+                    // we don't really care what the event is. most any change and we should probably reload
+                    info!("Updating config! {:?}", event);
+
+                    let new_config: String = fs::read_to_string(cli_path.clone()).unwrap();
+
+                    let new_config: RpcConfig = toml::from_str(&new_config).unwrap();
+
+                    config_sender.send(new_config).unwrap();
+                }
+                Err(e) => error!("watch error: {:?}", e),
             }
         }
     });
 
     // spawn the root task
     rt.block_on(async {
-        let (app, app_handle) = rpc_config.spawn().await?;
+        let (app, app_handles) = Web3ProxyApp::spawn_with_watched_config(config_receiver).await?;
 
         let frontend_handle = tokio::spawn(frontend::run(cli_config.port, app));
 
         // if everything is working, these should both run forever
         tokio::select! {
-            x = app_handle => {
+            x = flatten_handles(app_handles) => {
                 // TODO: error log if error
                 info!(?x, "app_handle exited");
             }
