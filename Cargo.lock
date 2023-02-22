@@ -6231,6 +6231,7 @@ dependencies = [
  "hashbrown 0.13.2",
  "http",
  "influxdb2",
+ "influxdb2-structmap",
  "ipnet",
  "itertools",
  "log",
