@@ -8,8 +8,8 @@ ENV CARGO_TERM_COLOR always
 # it will be cached from the second build onwards
 # TODO: more mount type cache?
 # TODO: do this in a seperate FROM and COPY it in
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo install cargo-nextest
+# RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#     cargo install cargo-nextest
 
 # foundry is needed to run tests
 # TODO: do this in a seperate FROM and COPY it in
@@ -33,9 +33,9 @@ RUN apt-get update && \
 COPY . .
 
 # test the application with cargo-nextest
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
-    cargo nextest run --features "rdkafka-src tokio-uring" --no-default-features
+# RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#     --mount=type=cache,target=/app/target \
+#     cargo nextest run --features "rdkafka-src tokio-uring" --no-default-features
 
 # build the application
 # using a "release" profile (which install does) is **very** important

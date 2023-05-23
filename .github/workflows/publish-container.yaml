@@ -49,15 +49,15 @@ jobs:
         password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
     - name: Build and export to local docker for testing
-      uses: docker/build-push-action@v3
+      uses: docker/build-push-action@v4
       with:
-        load: true
+        push: true
         tags: ${{ steps.image.outputs.NAME }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
     - name: Build arm64 additionaly and push multiarch image
-      uses: docker/build-push-action@v3
+      uses: docker/build-push-action@v4
       with:
         push: true
         tags: "${{ steps.image.outputs.NAME }}"
