@@ -48,10 +48,11 @@ jobs:
         username: ${{ secrets.DOCKER_HUB_USERNAME }}
         password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-    - name: Build and export to local docker for testing
+    - name: Build and export
       uses: docker/build-push-action@v3
       with:
         load: true
+        push: true
         tags: ${{ steps.image.outputs.NAME }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
