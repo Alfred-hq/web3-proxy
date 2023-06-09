@@ -51,7 +51,6 @@ jobs:
     - name: Build and export
       uses: docker/build-push-action@v3
       with:
-        load: true
         push: true
         tags: ${{ steps.image.outputs.NAME }}
         cache-from: type=gha
