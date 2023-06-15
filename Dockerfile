@@ -53,11 +53,6 @@ COPY . .
 
 ENV WEB3_PROXY_FEATURES "rdkafka-src"
 
-# test the application with cargo-nextest
-# RUN --mount=type=cache,target=/usr/local/cargo/registry \
-#     --mount=type=cache,target=/app/target \
-#     cargo nextest run --features "$WEB3_PROXY_FEATURES" --no-default-features
-
 # build the application
 # using a "release" profile (which install does by default) is **very** important
 # TODO: use the "faster_release" profile which builds with `codegen-units = 1`
