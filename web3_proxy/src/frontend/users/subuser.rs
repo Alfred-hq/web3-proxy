@@ -1,7 +1,7 @@
 //! Handle subusers, viewing subusers, and viewing accessible rpc-keys
 use crate::app::Web3ProxyApp;
+use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResponse};
 use crate::frontend::authorization::RpcSecretKey;
-use crate::frontend::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResponse};
 use anyhow::Context;
 use axum::{
     extract::Query,
@@ -11,14 +11,12 @@ use axum::{
 };
 use axum_macros::debug_handler;
 use entities::sea_orm_active_enums::Role;
-use entities::user::Relation::UserTier;
-use entities::{balance, rpc_key, secondary_user, user, user_tier};
+use entities::{balance, rpc_key, secondary_user, user};
 use ethers::types::Address;
 use hashbrown::HashMap;
 use http::StatusCode;
-use log::{debug, warn};
+use log::trace;
 use migration::sea_orm;
-use migration::sea_orm::prelude::Decimal;
 use migration::sea_orm::ActiveModelTrait;
 use migration::sea_orm::ColumnTrait;
 use migration::sea_orm::EntityTrait;
@@ -28,7 +26,6 @@ use migration::sea_orm::TransactionTrait;
 use serde_json::json;
 use std::sync::Arc;
 use ulid::{self, Ulid};
-use uuid::Uuid;
 
 pub async fn get_keys_as_subuser(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
@@ -47,7 +44,7 @@ pub async fn get_keys_as_subuser(
     // Get all secondary users that have access to this rpc key
     let secondary_user_entities = secondary_user::Entity::find()
         .filter(secondary_user::Column::UserId.eq(subuser.id))
-        .all(db_replica.conn())
+        .all(db_replica.as_ref())
         .await?
         .into_iter()
         .map(|x| (x.rpc_secret_key_id, x))
@@ -64,7 +61,7 @@ pub async fn get_keys_as_subuser(
             ),
         )
         .find_also_related(user::Entity)
-        .all(db_replica.conn())
+        .all(db_replica.as_ref())
         .await?;
 
     // TODO: Merge rpc-key with respective user (join is probably easiest ...)
@@ -107,28 +104,28 @@ pub async fn get_subusers(
         .db_replica()
         .context("getting replica db for user's revert logs")?;
 
-    let rpc_key: Ulid = params
-        .remove("rpc_key")
+    let rpc_key: u64 = params
+        .remove("key_id")
         // TODO: map_err so this becomes a 500. routing must be bad
         .ok_or(Web3ProxyError::BadRequest(
-            "You have not provided the 'rpc_key' whose access to modify".to_string(),
+            "You have not provided the 'rpc_key' whose access to modify".into(),
         ))?
         .parse()
-        .context(format!("unable to parse rpc_key {:?}", params))?;
+        .context(format!("unable to parse key_id {:?}", params))?;
 
     // Get the rpc key id
     let rpc_key = rpc_key::Entity::find()
-        .filter(rpc_key::Column::SecretKey.eq(Uuid::from(rpc_key)))
-        .one(db_replica.conn())
+        .filter(rpc_key::Column::Id.eq(rpc_key))
+        .one(db_replica.as_ref())
         .await?
         .ok_or(Web3ProxyError::BadRequest(
-            "The provided RPC key cannot be found".to_string(),
+            "The provided RPC key cannot be found".into(),
         ))?;
 
     // Get all secondary users that have access to this rpc key
     let secondary_user_entities = secondary_user::Entity::find()
         .filter(secondary_user::Column::RpcSecretKeyId.eq(rpc_key.id))
-        .all(db_replica.conn())
+        .all(db_replica.as_ref())
         .await?
         .into_iter()
         .map(|x| (x.user_id, x))
@@ -144,10 +141,10 @@ pub async fn get_subusers(
                     .collect::<Vec<_>>(),
             ),
         )
-        .all(db_replica.conn())
+        .all(db_replica.as_ref())
         .await?;
 
-    warn!("Subusers are: {:?}", subusers);
+    trace!("Subusers are: {}", json!(subusers));
 
     // Now return the list
     let response_json = json!({
@@ -181,24 +178,23 @@ pub async fn modify_subuser(
         .db_replica()
         .context("getting replica db for user's revert logs")?;
 
-    debug!("Parameters are: {:?}", params);
+    trace!("Parameters are: {:?}", params);
 
     // Then, distinguish the endpoint to modify
-    let rpc_key_to_modify: Ulid = params
-        .remove("rpc_key")
+    let rpc_key_to_modify: u64 = params
+        .remove("key_id")
         // TODO: map_err so this becomes a 500. routing must be bad
         .ok_or(Web3ProxyError::BadRequest(
-            "You have not provided the 'rpc_key' whose access to modify".to_string(),
+            "You have not provided the 'rpc_key' whose access to modify".into(),
         ))?
-        .parse::<Ulid>()
-        .context(format!("unable to parse rpc_key {:?}", params))?;
-    // let rpc_key_to_modify: Uuid = ulid::serde::ulid_as_uuid::deserialize(rpc_key_to_modify)?;
+        .parse()
+        .context(format!("unable to get the key_id {:?}", params))?;
 
     let subuser_address: Address = params
         .remove("subuser_address")
         // TODO: map_err so this becomes a 500. routing must be bad
         .ok_or(Web3ProxyError::BadRequest(
-            "You have not provided the 'user_address' whose access to modify".to_string(),
+            "You have not provided the 'user_address' whose access to modify".into(),
         ))?
         .parse()
         .context(format!("unable to parse subuser_address {:?}", params))?;
@@ -209,14 +205,14 @@ pub async fn modify_subuser(
         .remove("new_status")
         // TODO: map_err so this becomes a 500. routing must be bad
         .ok_or(Web3ProxyError::BadRequest(
-            "You have not provided the new_stats key in the request".to_string(),
+            "You have not provided the new_stats key in the request".into(),
         ))?
         .as_str()
     {
         "upsert" => Ok(true),
         "remove" => Ok(false),
         _ => Err(Web3ProxyError::BadRequest(
-            "'new_status' must be one of 'upsert' or 'remove'".to_string(),
+            "'new_status' must be one of 'upsert' or 'remove'".into(),
         )),
     }?;
 
@@ -224,7 +220,7 @@ pub async fn modify_subuser(
         .remove("new_role")
         // TODO: map_err so this becomes a 500. routing must be bad
         .ok_or(Web3ProxyError::BadRequest(
-            "You have not provided the new_role key in the request".to_string(),
+            "You have not provided the new_role key in the request".into(),
         ))?
         .as_str()
     {
@@ -235,7 +231,7 @@ pub async fn modify_subuser(
         "admin" => Ok(Role::Admin),
         "collaborator" => Ok(Role::Collaborator),
         _ => Err(Web3ProxyError::BadRequest(
-            "'new_role' must be one of 'owner', 'admin', 'collaborator'".to_string(),
+            "'new_role' must be one of 'owner', 'admin', 'collaborator'".into(),
         )),
     }?;
 
@@ -245,21 +241,21 @@ pub async fn modify_subuser(
     // ---------------------------
     let subuser = user::Entity::find()
         .filter(user::Column::Address.eq(subuser_address.as_ref()))
-        .one(db_replica.conn())
+        .one(db_replica.as_ref())
         .await?;
 
     let rpc_key_entity = rpc_key::Entity::find()
-        .filter(rpc_key::Column::SecretKey.eq(Uuid::from(rpc_key_to_modify)))
-        .one(db_replica.conn())
+        .filter(rpc_key::Column::Id.eq(rpc_key_to_modify))
+        .one(db_replica.as_ref())
         .await?
         .ok_or(Web3ProxyError::BadRequest(
-            "Provided RPC key does not exist!".to_owned(),
+            "Provided RPC key does not exist!".into(),
         ))?;
 
     // Make sure that the user owns the rpc_key_entity
     if rpc_key_entity.user_id != user.id {
         return Err(Web3ProxyError::BadRequest(
-            "you must own the RPC for which you are giving permissions out".to_string(),
+            "you must own the RPC for which you are giving permissions out".into(),
         ));
     }
 
@@ -295,8 +291,6 @@ pub async fn modify_subuser(
             // We should also create the balance entry ...
             let subuser_balance = balance::ActiveModel {
                 user_id: sea_orm::Set(subuser.id),
-                available_balance: sea_orm::Set(Decimal::new(0, 0)),
-                used_balance: sea_orm::Set(Decimal::new(0, 0)),
                 ..Default::default()
             };
             subuser_balance.insert(&txn).await?;
@@ -308,7 +302,7 @@ pub async fn modify_subuser(
         Some(subuser) => {
             if subuser.id == user.id {
                 return Err(Web3ProxyError::BadRequest(
-                    "you cannot make a subuser out of yourself".to_string(),
+                    "you cannot make a subuser out of yourself".into(),
                 ));
             }
 
@@ -316,7 +310,7 @@ pub async fn modify_subuser(
             // the user is already registered
             let subuser_rpc_keys = rpc_key::Entity::find()
                 .filter(rpc_key::Column::UserId.eq(subuser.id))
-                .all(db_replica.conn())
+                .all(db_replica.as_ref())
                 .await
                 .web3_context("failed loading user's key")?;
 
@@ -335,7 +329,7 @@ pub async fn modify_subuser(
     let subuser_entry_secondary_user = secondary_user::Entity::find()
         .filter(secondary_user::Column::UserId.eq(subuser.id))
         .filter(secondary_user::Column::RpcSecretKeyId.eq(rpc_key_entity.id))
-        .one(db_replica.conn())
+        .one(db_replica.as_ref())
         .await
         .web3_context("failed using the db to check for a subuser")?;
 

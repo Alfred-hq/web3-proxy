@@ -1,11 +1,10 @@
 //! `frontend` contains HTTP and websocket endpoints for use by a website or web3 wallet.
 //!
 //! Important reading about axum extractors: <https://docs.rs/axum/latest/axum/extract/index.html#the-order-of-extractors>
-
+// TODO: these are only public so docs are generated. What's a better way to do this?
 pub mod admin;
 pub mod authorization;
 pub mod errors;
-// TODO: these are only public so docs are generated. What's a better way to do this?
 pub mod rpc_proxy_http;
 pub mod rpc_proxy_ws;
 pub mod status;
@@ -19,7 +18,7 @@ use axum::{
 use http::{header::AUTHORIZATION, StatusCode};
 use listenfd::ListenFd;
 use log::{debug, info};
-use quick_cache_ttl::UnitWeighter;
+use moka::future::{Cache, CacheBuilder};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::{iter::once, time::Duration};
@@ -28,7 +27,7 @@ use tokio::sync::broadcast;
 use tower_http::cors::CorsLayer;
 use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 
-use self::errors::Web3ProxyResult;
+use crate::errors::Web3ProxyResult;
 
 /// simple keys for caching responses
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, EnumCount, EnumIter)]
@@ -38,12 +37,7 @@ pub enum ResponseCacheKey {
     Status,
 }
 
-pub type ResponseCache = quick_cache_ttl::CacheWithTTL<
-    ResponseCacheKey,
-    (StatusCode, &'static str, axum::body::Bytes),
-    UnitWeighter,
-    quick_cache_ttl::DefaultHashBuilder,
->;
+pub type ResponseCache = Cache<ResponseCacheKey, (StatusCode, &'static str, axum::body::Bytes)>;
 
 /// Start the frontend server.
 pub async fn serve(
@@ -59,12 +53,10 @@ pub async fn serve(
 
     debug!("response_cache size: {}", response_cache_size);
 
-    let response_cache = ResponseCache::new(
-        "response_cache",
-        response_cache_size,
-        Duration::from_secs(1),
-    )
-    .await;
+    let response_cache: ResponseCache = CacheBuilder::new(response_cache_size as u64)
+        .name("frontend_response")
+        .time_to_live(Duration::from_secs(1))
+        .build();
 
     // TODO: read config for if fastest/versus should be available publicly. default off
 
@@ -167,7 +159,7 @@ pub async fn serve(
         .route(
             // /:rpc_key/:subuser_address/:new_status/:new_role
             "/user/subuser",
-            get(users::subuser::modify_subuser),
+            post(users::subuser::modify_subuser),
         )
         .route("/user/subusers", get(users::subuser::get_subusers))
         .route(
@@ -180,7 +172,7 @@ pub async fn serve(
         .route("/user/deposits", get(users::payment::user_deposits_get))
         .route(
             "/user/balance/:tx_hash",
-            get(users::payment::user_balance_post),
+            post(users::payment::user_balance_post),
         )
         .route("/user/keys", get(users::rpc_keys::rpc_keys_get))
         .route("/user/keys", post(users::rpc_keys::rpc_keys_management))
@@ -189,6 +181,14 @@ pub async fn serve(
         .route(
             "/user/referral",
             get(users::referral::user_referral_link_get),
+        )
+        .route(
+            "/user/referral/stats/used-codes",
+            get(users::referral::user_used_referral_stats),
+        )
+        .route(
+            "/user/referral/stats/shared-codes",
+            get(users::referral::user_shared_referral_stats),
         )
         .route("/user/revert_logs", get(users::stats::user_revert_logs_get))
         .route(

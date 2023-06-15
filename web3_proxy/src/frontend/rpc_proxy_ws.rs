@@ -3,11 +3,11 @@
 //! WebSockets are the preferred method of receiving requests, but not all clients have good support.
 
 use super::authorization::{ip_is_authorized, key_is_authorized, Authorization, RequestMetadata};
-use super::errors::{Web3ProxyError, Web3ProxyResponse};
+use crate::errors::{Web3ProxyError, Web3ProxyResponse};
 use crate::jsonrpc::JsonRpcId;
 use crate::{
     app::Web3ProxyApp,
-    frontend::errors::Web3ProxyResult,
+    errors::Web3ProxyResult,
     jsonrpc::{JsonRpcForwardedResponse, JsonRpcForwardedResponseEnum, JsonRpcRequest},
 };
 use anyhow::Context;
@@ -21,7 +21,6 @@ use axum::{
 use axum_client_ip::InsecureClientIp;
 use axum_macros::debug_handler;
 use ethers::types::U64;
-use fstrings::{f, format_args_f};
 use futures::SinkExt;
 use futures::{
     future::AbortHandle,
@@ -32,8 +31,9 @@ use hashbrown::HashMap;
 use http::StatusCode;
 use log::{info, trace};
 use serde_json::json;
+use std::str::from_utf8_mut;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::{str::from_utf8_mut, sync::atomic::AtomicUsize};
 use tokio::sync::{broadcast, OwnedSemaphorePermit, RwLock};
 
 /// How to select backend servers for a request
@@ -253,9 +253,6 @@ async fn _websocket_handler_with_key(
         }
         None => {
             // if no websocket upgrade, this is probably a user loading the url with their browser
-
-            // TODO: rate limit here? key_is_authorized might be enough
-
             match (
                 &app.config.redirect_public_url,
                 &app.config.redirect_rpc_key_url,
@@ -263,38 +260,26 @@ async fn _websocket_handler_with_key(
             ) {
                 (None, None, _) => Err(Web3ProxyError::StatusCode(
                     StatusCode::BAD_REQUEST,
-                    "this page is for rpcs".to_string(),
+                    "this page is for rpcs".into(),
                     None,
                 )),
                 (Some(redirect_public_url), _, None) => {
                     Ok(Redirect::permanent(redirect_public_url).into_response())
                 }
-                (_, Some(redirect_rpc_key_url), rpc_key_id) => {
+                (_, Some(redirect_rpc_key_url), Some(rpc_key_id)) => {
                     let reg = Handlebars::new();
 
-                    if authorization.checks.rpc_secret_key_id.is_none() {
-                        // i don't think this is possible
-                        Err(Web3ProxyError::StatusCode(
-                            StatusCode::UNAUTHORIZED,
-                            "AUTHORIZATION header required".to_string(),
-                            None,
-                        ))
-                    } else {
-                        let redirect_rpc_key_url = reg
-                            .render_template(
-                                redirect_rpc_key_url,
-                                &json!({ "rpc_key_id": rpc_key_id }),
-                            )
-                            .expect("templating should always work");
+                    let redirect_rpc_key_url = reg
+                        .render_template(redirect_rpc_key_url, &json!({ "rpc_key_id": rpc_key_id }))
+                        .expect("templating should always work");
 
-                        // this is not a websocket. redirect to a page for this user
-                        Ok(Redirect::permanent(&redirect_rpc_key_url).into_response())
-                    }
+                    // this is not a websocket. redirect to a page for this user
+                    Ok(Redirect::permanent(&redirect_rpc_key_url).into_response())
                 }
                 // any other combinations get a simple error
                 _ => Err(Web3ProxyError::StatusCode(
                     StatusCode::BAD_REQUEST,
-                    "this page is for rpcs".to_string(),
+                    "this page is for rpcs".into(),
                     None,
                 )),
             }
@@ -318,119 +303,104 @@ async fn proxy_web3_socket(
 }
 
 /// websockets support a few more methods than http clients
-/// TODO: i think this subscriptions hashmap grows unbounded
 async fn handle_socket_payload(
     app: Arc<Web3ProxyApp>,
     authorization: &Arc<Authorization>,
     payload: &str,
     response_sender: &flume::Sender<Message>,
-    subscription_count: &AtomicUsize,
+    subscription_count: &AtomicU64,
     subscriptions: Arc<RwLock<HashMap<U64, AbortHandle>>>,
 ) -> Web3ProxyResult<(Message, Option<OwnedSemaphorePermit>)> {
-    let (authorization, semaphore) = match authorization.check_again(&app).await {
-        Ok((a, s)) => (a, s),
-        Err(err) => {
-            let (_, err) = err.into_response_parts();
+    let (authorization, semaphore) = authorization.check_again(&app).await?;
 
-            let err = JsonRpcForwardedResponse::from_response_data(err, Default::default());
-
-            let err = serde_json::to_string(&err)?;
-
-            return Ok((Message::Text(err), None));
-        }
-    };
-
-    // TODO: do any clients send batches over websockets?
-    // TODO: change response into response_data
+    // TODO: handle batched requests
     let (response_id, response) = match serde_json::from_str::<JsonRpcRequest>(payload) {
         Ok(json_request) => {
             let response_id = json_request.id.clone();
 
             // TODO: move this to a seperate function so we can use the try operator
-            let response: Web3ProxyResult<JsonRpcForwardedResponseEnum> =
-                match &json_request.method[..] {
-                    "eth_subscribe" => {
-                        // TODO: how can we subscribe with proxy_mode?
-                        match app
-                            .eth_subscribe(
-                                authorization.clone(),
-                                json_request,
-                                subscription_count,
-                                response_sender.clone(),
-                            )
-                            .await
-                        {
-                            Ok((handle, response)) => {
-                                {
-                                    let mut x = subscriptions.write().await;
-
-                                    let result: &serde_json::value::RawValue = response
-                                        .result
-                                        .as_ref()
-                                        .context("there should be a result here")?;
-
-                                    // TODO: there must be a better way to turn a RawValue
-                                    let k: U64 = serde_json::from_str(result.get())
-                                        .context("subscription ids must be U64s")?;
-
-                                    x.insert(k, handle);
-                                };
-
-                                Ok(response.into())
-                            }
-                            Err(err) => Err(err),
-                        }
-                    }
-                    "eth_unsubscribe" => {
-                        let request_metadata =
-                            RequestMetadata::new(&app, authorization.clone(), &json_request, None)
-                                .await;
-
-                        #[derive(serde::Deserialize)]
-                        struct EthUnsubscribeParams([U64; 1]);
-
-                        if let Some(params) = json_request.params {
-                            match serde_json::from_value(params) {
-                                Ok::<EthUnsubscribeParams, _>(params) => {
-                                    let subscription_id = &params.0[0];
-
-                                    // TODO: is this the right response?
-                                    let partial_response = {
-                                        let mut x = subscriptions.write().await;
-                                        match x.remove(subscription_id) {
-                                            None => false,
-                                            Some(handle) => {
-                                                handle.abort();
-                                                true
-                                            }
-                                        }
-                                    };
-
-                                    // TODO: don't create the response here. use a JsonRpcResponseData instead
-                                    let response = JsonRpcForwardedResponse::from_value(
-                                        json!(partial_response),
-                                        response_id.clone(),
-                                    );
-
-                                    request_metadata.add_response(&response);
-
-                                    Ok(response.into())
-                                }
-                                Err(err) => Err(Web3ProxyError::BadRequest(f!(
-                                    "incorrect params given for eth_unsubscribe. {err:?}"
-                                ))),
-                            }
-                        } else {
-                            Err(Web3ProxyError::BadRequest(
-                                "no params given for eth_unsubscribe".to_string(),
-                            ))
-                        }
-                    }
-                    _ => app
-                        .proxy_web3_rpc(authorization.clone(), json_request.into())
+            let response: Web3ProxyResult<JsonRpcForwardedResponseEnum> = match &json_request.method
+                [..]
+            {
+                "eth_subscribe" => {
+                    // TODO: how can we subscribe with proxy_mode?
+                    match app
+                        .eth_subscribe(
+                            authorization.clone(),
+                            json_request,
+                            subscription_count,
+                            response_sender.clone(),
+                        )
                         .await
-                        .map(|(status_code, response, _)| response),
-                };
+                    {
+                        Ok((handle, response)) => {
+                            if let Some(subscription_id) = response.result.clone() {
+                                let mut x = subscriptions.write().await;
+
+                                let key: U64 = serde_json::from_str(subscription_id.get()).unwrap();
+
+                                info!("key: {}", key);
+
+                                x.insert(key, handle);
+                            }
+
+                            Ok(response.into())
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+                "eth_unsubscribe" => {
+                    let request_metadata =
+                        RequestMetadata::new(&app, authorization.clone(), &json_request, None)
+                            .await;
+
+                    let subscription_id: U64 =
+                        if let Some(param) = json_request.params.get(0).cloned() {
+                            serde_json::from_value(param)
+                                .context("failed parsing [subscription_id] as a U64")?
+                        } else {
+                            match serde_json::from_value::<U64>(json_request.params) {
+                                Ok(x) => x,
+                                Err(err) => {
+                                    return Err(Web3ProxyError::BadRequest(
+                                        format!(
+                                            "unexpected params given for eth_unsubscribe: {:?}",
+                                            err
+                                        )
+                                        .into(),
+                                    ))
+                                }
+                            }
+                        };
+
+                    info!("key: {}", subscription_id);
+
+                    // TODO: is this the right response?
+                    let partial_response = {
+                        let mut x = subscriptions.write().await;
+                        match x.remove(&subscription_id) {
+                            None => false,
+                            Some(handle) => {
+                                handle.abort();
+                                true
+                            }
+                        }
+                    };
+
+                    let response = JsonRpcForwardedResponse::from_value(
+                        json!(partial_response),
+                        response_id.clone(),
+                    );
+
+                    request_metadata.add_response(&response);
+
+                    Ok(response.into())
+                }
+                _ => app
+                    .proxy_web3_rpc(authorization.clone(), json_request.into())
+                    .await
+                    .map(|(_, response, _)| response),
+            };
 
             (response_id, response)
         }
@@ -443,7 +413,7 @@ async fn handle_socket_payload(
     let response_str = match response {
         Ok(x) => serde_json::to_string(&x).expect("to_string should always work here"),
         Err(err) => {
-            let (_, response_data) = err.into_response_parts();
+            let (_, response_data) = err.as_response_parts();
 
             let response = JsonRpcForwardedResponse::from_response_data(response_data, response_id);
 
@@ -462,7 +432,7 @@ async fn read_web3_socket(
 ) {
     // RwLock should be fine here. a user isn't going to be opening tons of subscriptions
     let subscriptions = Arc::new(RwLock::new(HashMap::new()));
-    let subscription_count = Arc::new(AtomicUsize::new(1));
+    let subscription_count = Arc::new(AtomicU64::new(1));
 
     let (close_sender, mut close_receiver) = broadcast::channel(1);
 
@@ -470,8 +440,7 @@ async fn read_web3_socket(
         tokio::select! {
             msg = ws_rx.next() => {
                 if let Some(Ok(msg)) = msg {
-                    // spawn so that we can serve responses from this loop even faster
-                    // TODO: only do these clones if the msg is text/binary?
+                    // clone things so we can handle multiple messages in parallel
                     let close_sender = close_sender.clone();
                     let app = app.clone();
                     let authorization = authorization.clone();
@@ -480,29 +449,29 @@ async fn read_web3_socket(
                     let subscription_count = subscription_count.clone();
 
                     let f = async move {
-                        let mut _semaphore = None;
-
-                        // new message from our client. forward to a backend and then send it through response_tx
-                        let response_msg = match msg {
-                            Message::Text(ref payload) => {
-                                // TODO: do not unwrap!
-                                let (msg, s) = handle_socket_payload(
-                                    app.clone(),
+                        // new message from our client. forward to a backend and then send it through response_sender
+                        let (response_msg, _semaphore) = match msg {
+                            Message::Text(payload) => {
+                                match handle_socket_payload(
+                                    app,
                                     &authorization,
-                                    payload,
+                                    &payload,
                                     &response_sender,
                                     &subscription_count,
                                     subscriptions,
                                 )
-                                .await.unwrap();
-
-                                _semaphore = s;
-
-                                msg
+                                .await {
+                                    Ok((m, s)) => (m, Some(s)),
+                                    Err(err) => {
+                                        // TODO: how can we get the id out of the payload?
+                                        let m = err.into_message(None);
+                                        (m, None)
+                                    }
+                                }
                             }
                             Message::Ping(x) => {
                                 trace!("ping: {:?}", x);
-                                Message::Pong(x)
+                                (Message::Pong(x), None)
                             }
                             Message::Pong(x) => {
                                 trace!("pong: {:?}", x);
@@ -517,29 +486,37 @@ async fn read_web3_socket(
                             Message::Binary(mut payload) => {
                                 let payload = from_utf8_mut(&mut payload).unwrap();
 
-                                // TODO: do not unwrap!
-                                let (msg, s) = handle_socket_payload(
-                                    app.clone(),
+                                let (m, s) = match handle_socket_payload(
+                                    app,
                                     &authorization,
                                     payload,
                                     &response_sender,
                                     &subscription_count,
                                     subscriptions,
                                 )
-                                .await.unwrap();
+                                .await {
+                                    Ok((m, s)) => (m, Some(s)),
+                                    Err(err) => {
+                                        // TODO: how can we get the id out of the payload?
+                                        let m = err.into_message(None);
+                                        (m, None)
+                                    }
+                                };
 
-                                _semaphore = s;
+                                // TODO: is this an okay way to convert from text to binary?
+                                let m = if let Message::Text(m) = m {
+                                    Message::Binary(m.as_bytes().to_vec())
+                                } else {
+                                    unimplemented!();
+                                };
 
-                                msg
+                                (m, s)
                             }
                         };
 
                         if response_sender.send_async(response_msg).await.is_err() {
                             let _ = close_sender.send(true);
-                            return;
                         };
-
-                        _semaphore = None;
                     };
 
                     tokio::spawn(f);
@@ -560,11 +537,10 @@ async fn write_web3_socket(
 ) {
     // TODO: increment counter for open websockets
 
-    // TODO: is there any way to make this stream receive.
     while let Ok(msg) = response_rx.recv_async().await {
         // a response is ready
 
-        // TODO: poke rate limits for this user?
+        // we do not check rate limits here. they are checked before putting things into response_sender;
 
         // forward the response to through the websocket
         if let Err(err) = ws_tx.send(msg).await {

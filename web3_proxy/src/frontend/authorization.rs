@@ -1,8 +1,8 @@
 //! Utilities for authorization of logged in and anonymous users.
 
-use super::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use super::rpc_proxy_ws::ProxyMode;
 use crate::app::{AuthorizationChecks, Web3ProxyApp, APP_USER_AGENT};
+use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::jsonrpc::{JsonRpcForwardedResponse, JsonRpcRequest};
 use crate::rpcs::one::Web3Rpc;
 use crate::stats::{AppStat, BackendRequests, RpcQueryStats};
@@ -23,20 +23,21 @@ use hashbrown::HashMap;
 use http::HeaderValue;
 use ipnet::IpNet;
 use log::{error, trace, warn};
+use migration::sea_orm::prelude::Decimal;
 use migration::sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use rdkafka::message::{Header as KafkaHeader, OwnedHeaders as KafkaOwnedHeaders, OwnedMessage};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout as KafkaTimeout;
 use redis_rate_limiter::redis::AsyncCommands;
 use redis_rate_limiter::RedisRateLimitResult;
-use std::convert::Infallible;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
 use std::mem;
+use std::num::NonZeroU64;
 use std::sync::atomic::{self, AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
 use std::time::Duration;
 use std::{net::IpAddr, str::FromStr, sync::Arc};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use ulid::Ulid;
@@ -72,7 +73,6 @@ pub enum AuthorizationType {
 #[derive(Clone, Debug)]
 pub struct Authorization {
     pub checks: AuthorizationChecks,
-    // TODO: instead of the conn, have a channel?
     pub db_conn: Option<DatabaseConnection>,
     pub ip: IpAddr,
     pub origin: Option<Origin>,
@@ -281,6 +281,15 @@ pub struct RequestMetadata {
 
     /// Cancel-safe channel for sending stats to the buffer
     pub stat_sender: Option<flume::Sender<AppStat>>,
+
+    /// Latest balance
+    pub latest_balance: Arc<RwLock<Decimal>>,
+}
+
+impl Default for Authorization {
+    fn default() -> Self {
+        Authorization::internal(None).unwrap()
+    }
 }
 
 impl Default for RequestMetadata {
@@ -301,7 +310,17 @@ impl Default for RequestMetadata {
             response_timestamp: Default::default(),
             start_instant: Instant::now(),
             stat_sender: Default::default(),
+            latest_balance: Default::default(),
         }
+    }
+}
+
+impl RequestMetadata {
+    pub fn proxy_mode(&self) -> ProxyMode {
+        self.authorization
+            .as_ref()
+            .map(|x| x.checks.proxy_mode)
+            .unwrap_or_default()
     }
 }
 
@@ -417,6 +436,19 @@ impl RequestMetadata {
             }
         }
 
+        // Get latest balance from cache
+        let latest_balance = match app
+            .balance_checks(authorization.checks.user_id)
+            .await
+            .context("Could not retrieve balance from database or cache!")
+        {
+            Ok(x) => x,
+            Err(err) => {
+                error!("{}", err);
+                Arc::new(RwLock::new(Decimal::default()))
+            }
+        };
+
         let x = Self {
             archive_request: false.into(),
             backend_requests: Default::default(),
@@ -433,6 +465,7 @@ impl RequestMetadata {
             response_timestamp: 0.into(),
             start_instant: Instant::now(),
             stat_sender: app.stat_sender.clone(),
+            latest_balance,
         };
 
         Arc::new(x)
@@ -611,7 +644,7 @@ impl Authorization {
     pub fn internal(db_conn: Option<DatabaseConnection>) -> Web3ProxyResult<Self> {
         let authorization_checks = AuthorizationChecks {
             // any error logs on a local (internal) query are likely problems. log them all
-            log_revert_chance: 1.0,
+            log_revert_chance: 100,
             tracking_level: TrackingLevel::Detailed,
             // default for everything else should be fine. we don't have a user_id or ip to give
             ..Default::default()
@@ -752,6 +785,7 @@ pub async fn login_is_authorized(app: &Web3ProxyApp, ip: IpAddr) -> Web3ProxyRes
 }
 
 /// semaphore won't ever be None, but its easier if key auth and ip auth work the same way
+/// keep the semaphore alive until the user's request is entirely complete
 pub async fn ip_is_authorized(
     app: &Arc<Web3ProxyApp>,
     ip: IpAddr,
@@ -817,6 +851,7 @@ pub async fn ip_is_authorized(
 }
 
 /// like app.rate_limit_by_rpc_key but converts to a Web3ProxyError;
+/// keep the semaphore alive until the user's request is entirely complete
 pub async fn key_is_authorized(
     app: &Arc<Web3ProxyApp>,
     rpc_key: RpcSecretKey,
@@ -885,13 +920,12 @@ impl Web3ProxyApp {
         if let Some(max_concurrent_requests) = self.config.public_max_concurrent_requests {
             let semaphore = self
                 .ip_semaphores
-                .get_or_insert_async::<Infallible>(ip, async move {
+                .get_with_by_ref(ip, async {
                     // TODO: set max_concurrent_requests dynamically based on load?
                     let s = Semaphore::new(max_concurrent_requests);
-                    Ok(Arc::new(s))
+                    Arc::new(s)
                 })
-                .await
-                .expect("infallible");
+                .await;
 
             let semaphore_permit = semaphore.acquire_owned().await?;
 
@@ -902,6 +936,7 @@ impl Web3ProxyApp {
     }
 
     /// Limit the number of concurrent requests for a given user across all of their keys
+    /// keep the semaphore alive until the user's request is entirely complete
     pub async fn user_semaphore(
         &self,
         authorization_checks: &AuthorizationChecks,
@@ -914,12 +949,11 @@ impl Web3ProxyApp {
 
             let semaphore = self
                 .user_semaphores
-                .get_or_insert_async::<Infallible>(&user_id, async move {
+                .get_with_by_ref(&user_id, async move {
                     let s = Semaphore::new(max_concurrent_requests as usize);
-                    Ok(Arc::new(s))
+                    Arc::new(s)
                 })
-                .await
-                .expect("infallible");
+                .await;
 
             let semaphore_permit = semaphore.acquire_owned().await?;
 
@@ -932,6 +966,7 @@ impl Web3ProxyApp {
 
     /// Verify that the given bearer token and address are allowed to take the specified action.
     /// This includes concurrent request limiting.
+    /// keep the semaphore alive until the user's request is entirely complete
     pub async fn bearer_is_authorized(
         &self,
         bearer: Bearer,
@@ -942,12 +977,11 @@ impl Web3ProxyApp {
         // limit concurrent requests
         let semaphore = self
             .bearer_token_semaphores
-            .get_or_insert_async::<Infallible>(&user_bearer_token, async move {
+            .get_with_by_ref(&user_bearer_token, async move {
                 let s = Semaphore::new(self.config.bearer_token_max_concurrent_requests as usize);
-                Ok(Arc::new(s))
+                Arc::new(s)
             })
-            .await
-            .expect("infallible");
+            .await;
 
         let semaphore_permit = semaphore.acquire_owned().await?;
 
@@ -961,7 +995,7 @@ impl Web3ProxyApp {
         let user = user::Entity::find()
             .left_join(login::Entity)
             .filter(login::Column::BearerToken.eq(user_bearer_uuid))
-            .one(db_replica.conn())
+            .one(db_replica.as_ref())
             .await
             .web3_context("fetching user from db by bearer token")?
             .web3_context("unknown bearer token")?;
@@ -1031,6 +1065,13 @@ impl Web3ProxyApp {
         origin: Option<Origin>,
         proxy_mode: ProxyMode,
     ) -> Web3ProxyResult<RateLimitResult> {
+        if ip.is_loopback() {
+            // TODO: localhost being unlimited should be optional
+            let authorization = Authorization::internal(self.db_conn())?;
+
+            return Ok(RateLimitResult::Allowed(authorization, None));
+        }
+
         // ip rate limits don't check referer or user agent
         // they do check origin because we can override rate limits for some origins
         let authorization = Authorization::external(
@@ -1084,6 +1125,38 @@ impl Web3ProxyApp {
         }
     }
 
+    /// Get the balance for the user.
+    ///
+    /// If a subuser calls this function, the subuser needs to have first attained the user_id that the rpc key belongs to.
+    /// This function should be called anywhere where balance is required (i.e. only rpc calls, I believe ... non-rpc calls don't really require balance)
+    pub(crate) async fn balance_checks(
+        &self,
+        user_id: u64,
+    ) -> Web3ProxyResult<Arc<RwLock<Decimal>>> {
+        match NonZeroU64::try_from(user_id) {
+            Err(_) => Ok(Arc::new(RwLock::new(Decimal::default()))),
+            Ok(x) => self
+                .user_balance_cache
+                .try_get_with_by_ref(&x, async move {
+                    let db_replica = self
+                        .db_replica()
+                        .web3_context("Getting database connection")?;
+
+                    let balance: Decimal = match balance::Entity::find()
+                        .filter(balance::Column::UserId.eq(user_id))
+                        .one(db_replica.as_ref())
+                        .await?
+                    {
+                        Some(x) => x.total_deposits - x.total_spent_outside_free_tier,
+                        None => Decimal::default(),
+                    };
+                    Ok(Arc::new(RwLock::new(balance)))
+                })
+                .await
+                .map_err(Into::into),
+        }
+    }
+
     // check the local cache for user data, or query the database
     pub(crate) async fn authorization_checks(
         &self,
@@ -1091,7 +1164,7 @@ impl Web3ProxyApp {
         rpc_secret_key: RpcSecretKey,
     ) -> Web3ProxyResult<AuthorizationChecks> {
         self.rpc_secret_key_cache
-            .try_get_or_insert_async(&rpc_secret_key, async move {
+            .try_get_with_by_ref(&rpc_secret_key, async move {
                 // trace!(?rpc_secret_key, "user cache miss");
 
                 let db_replica = self
@@ -1104,30 +1177,12 @@ impl Web3ProxyApp {
                 match rpc_key::Entity::find()
                     .filter(rpc_key::Column::SecretKey.eq(<Uuid>::from(rpc_secret_key)))
                     .filter(rpc_key::Column::Active.eq(true))
-                    .one(db_replica.conn())
+                    .one(db_replica.as_ref())
                     .await?
                 {
                     Some(rpc_key_model) => {
                         // TODO: move these splits into helper functions
                         // TODO: can we have sea orm handle this for us?
-                        let user_model = user::Entity::find_by_id(rpc_key_model.user_id)
-                            .one(db_replica.conn())
-                            .await?
-                            .context("no related user")?;
-
-                        let balance = balance::Entity::find()
-                            .filter(balance::Column::UserId.eq(user_model.id))
-                            .one(db_replica.conn())
-                            .await?
-                            .map(|x| x.available_balance)
-                            .unwrap_or_default();
-
-                        let user_tier_model =
-                            user_tier::Entity::find_by_id(user_model.user_tier_id)
-                                .one(db_replica.conn())
-                                .await?
-                                .context("no related user tier")?;
-
                         let allowed_ips: Option<Vec<IpNet>> =
                             if let Some(allowed_ips) = rpc_key_model.allowed_ips {
                                 let x = allowed_ips
@@ -1187,8 +1242,42 @@ impl Web3ProxyApp {
                                 None
                             };
 
-                        let rpc_key_id =
-                            Some(rpc_key_model.id.try_into().expect("db ids are never 0"));
+                        // Get the user_tier
+                        let user_model = user::Entity::find_by_id(rpc_key_model.user_id)
+                            .one(db_replica.as_ref())
+                            .await?
+                            .context("user model was not found, but every rpc_key should have a user")?;
+
+                        let balance = match balance::Entity::find()
+                            .filter(balance::Column::UserId.eq(user_model.id))
+                            .one(db_replica.as_ref())
+                            .await? {
+                            Some(x) => x.total_deposits - x.total_spent_outside_free_tier,
+                            None => Decimal::default()
+                        };
+
+                        let mut user_tier_model =
+                            user_tier::Entity::find_by_id(user_model.user_tier_id)
+                                .one(db_replica.as_ref())
+                                .await?
+                                .context("related user tier not found, but every user should have a tier")?;
+
+                        // TODO: Do the logic here, as to how to treat the user, based on balance and initial check
+                        // Clear the cache (not the login!) in the stats if a tier-change happens (clear, but don't modify roles)
+                        if user_tier_model.title == "Premium" && balance < Decimal::new(1, 1) {
+                            // Find the equivalent downgraded user tier, and modify limits from there
+                            if let Some(downgrade_user_tier) = user_tier_model.downgrade_tier_id {
+                                user_tier_model =
+                                    user_tier::Entity::find_by_id(downgrade_user_tier)
+                                        .one(db_replica.as_ref())
+                                        .await?
+                                        .context("finding the downgrade user tier for premium did not work for premium")?;
+                            } else {
+                                return Err(Web3ProxyError::InvalidUserTier);
+                            }
+                        }
+
+                        let rpc_key_id = Some(rpc_key_model.id.try_into().context("db ids are never 0")?);
 
                         Ok(AuthorizationChecks {
                             user_id: rpc_key_model.user_id,
@@ -1199,18 +1288,19 @@ impl Web3ProxyApp {
                             allowed_referers,
                             allowed_user_agents,
                             tracking_level: rpc_key_model.log_level,
-                            log_revert_chance: rpc_key_model.log_revert_chance,
+                            // TODO: is floating point math going to scale this correctly
+                            log_revert_chance: (rpc_key_model.log_revert_chance * u16::MAX as f64) as u16,
                             max_concurrent_requests: user_tier_model.max_concurrent_requests,
                             max_requests_per_period: user_tier_model.max_requests_per_period,
                             private_txs: rpc_key_model.private_txs,
                             proxy_mode,
-                            balance: Some(balance),
                         })
                     }
                     None => Ok(AuthorizationChecks::default()),
                 }
             })
             .await
+            .map_err(Into::into)
     }
 
     /// Authorized the ip/origin/referer/useragent and rate limit and concurrency
@@ -1224,6 +1314,7 @@ impl Web3ProxyApp {
         user_agent: Option<UserAgent>,
     ) -> Web3ProxyResult<RateLimitResult> {
         let authorization_checks = self.authorization_checks(proxy_mode, rpc_key).await?;
+        let balance = self.balance_checks(authorization_checks.user_id).await?;
 
         // if no rpc_key_id matching the given rpc was found, then we can't rate limit by key
         if authorization_checks.rpc_secret_key_id.is_none() {

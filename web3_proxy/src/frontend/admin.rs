@@ -1,10 +1,10 @@
 //! Handle admin helper logic
 
 use super::authorization::login_is_authorized;
-use super::errors::Web3ProxyResponse;
 use crate::admin_queries::query_admin_modify_usertier;
 use crate::app::Web3ProxyApp;
-use crate::frontend::errors::{Web3ProxyError, Web3ProxyErrorContext};
+use crate::errors::Web3ProxyResponse;
+use crate::errors::{Web3ProxyError, Web3ProxyErrorContext};
 use crate::user_token::UserBearerToken;
 use crate::PostLogin;
 use anyhow::Context;
@@ -19,7 +19,7 @@ use axum_macros::debug_handler;
 use chrono::{TimeZone, Utc};
 use entities::{
     admin, admin_increase_balance_receipt, admin_trail, balance, login, pending_login, rpc_key,
-    user, user_tier,
+    user,
 };
 use ethers::{prelude::Address, types::Bytes};
 use hashbrown::HashMap;
@@ -67,32 +67,30 @@ pub async fn admin_increase_balance(
     let user_address: Address = params
         .get("user_address")
         .ok_or_else(|| {
-            Web3ProxyError::BadRequest("Unable to find user_address key in request".to_string())
+            Web3ProxyError::BadRequest("Unable to find user_address key in request".into())
         })?
         .parse::<Address>()
         .map_err(|_| {
-            Web3ProxyError::BadRequest("Unable to parse user_address as an Address".to_string())
+            Web3ProxyError::BadRequest("Unable to parse user_address as an Address".into())
         })?;
     let user_address_bytes: Vec<u8> = user_address.to_fixed_bytes().into();
     let note: String = params
         .get("note")
-        .ok_or_else(|| {
-            Web3ProxyError::BadRequest("Unable to find 'note' key in request".to_string())
-        })?
+        .ok_or_else(|| Web3ProxyError::BadRequest("Unable to find 'note' key in request".into()))?
         .parse::<String>()
-        .map_err(|_| {
-            Web3ProxyError::BadRequest("Unable to parse 'note' as a String".to_string())
-        })?;
+        .map_err(|_| Web3ProxyError::BadRequest("Unable to parse 'note' as a String".into()))?;
     // Get the amount from params
     // Decimal::from_str
     let amount: Decimal = params
         .get("amount")
         .ok_or_else(|| {
-            Web3ProxyError::BadRequest("Unable to get the amount key from the request".to_string())
+            Web3ProxyError::BadRequest("Unable to get the amount key from the request".into())
         })
         .map(|x| Decimal::from_str(x))?
         .map_err(|err| {
-            Web3ProxyError::BadRequest(format!("Unable to parse amount from the request {:?}", err))
+            Web3ProxyError::BadRequest(
+                format!("Unable to parse amount from the request {:?}", err).into(),
+            )
         })?;
 
     let user_entry: user::Model = user::Entity::find()
@@ -100,7 +98,7 @@ pub async fn admin_increase_balance(
         .one(&db_conn)
         .await?
         .ok_or(Web3ProxyError::BadRequest(
-            "No user with this id found".to_string(),
+            "No user with this id found".into(),
         ))?;
 
     let increase_balance_receipt = admin_increase_balance_receipt::ActiveModel {
@@ -119,49 +117,25 @@ pub async fn admin_increase_balance(
     );
     out.insert("amount", serde_json::Value::String(amount.to_string()));
 
-    // Get the balance row
-    let balance_entry: balance::Model = balance::Entity::find()
-        .filter(balance::Column::UserId.eq(user_entry.id))
-        .one(&db_conn)
-        .await?
-        .context("User does not have a balance row")?;
-
-    // Finally make the user premium if balance is above 10$
-    let premium_user_tier = user_tier::Entity::find()
-        .filter(user_tier::Column::Title.eq("Premium"))
-        .one(&db_conn)
-        .await?
-        .context("Premium tier was not found!")?;
-
-    let balance_entry = balance_entry.into_active_model();
+    // update balance
+    let balance_entry = balance::ActiveModel {
+        id: sea_orm::NotSet,
+        total_deposits: sea_orm::Set(amount),
+        user_id: sea_orm::Set(user_entry.id),
+        ..Default::default()
+    };
     balance::Entity::insert(balance_entry)
         .on_conflict(
             OnConflict::new()
-                .values([
-                    // (
-                    //     balance::Column::Id,
-                    //     Expr::col(balance::Column::Id).add(self.frontend_requests),
-                    // ),
-                    (
-                        balance::Column::AvailableBalance,
-                        Expr::col(balance::Column::AvailableBalance).add(amount),
-                    ),
-                    // (
-                    //     balance::Column::Used,
-                    //     Expr::col(balance::Column::UsedBalance).add(self.backend_retries),
-                    // ),
-                    // (
-                    //     balance::Column::UserId,
-                    //     Expr::col(balance::Column::UserId).add(self.no_servers),
-                    // ),
-                ])
+                .values([(
+                    balance::Column::TotalDeposits,
+                    Expr::col(balance::Column::TotalDeposits).add(amount),
+                )])
                 .to_owned(),
         )
         .exec(&db_conn)
         .await?;
-    // TODO: Downgrade otherwise, right now not functioning properly
 
-    // Then read and save in one transaction
     let response = (StatusCode::OK, Json(out)).into_response();
 
     Ok(response)
@@ -218,22 +192,22 @@ pub async fn admin_login_get(
     let admin_address: Address = params
         .get("admin_address")
         .ok_or_else(|| {
-            Web3ProxyError::BadRequest("Unable to find admin_address key in request".to_string())
+            Web3ProxyError::BadRequest("Unable to find admin_address key in request".into())
         })?
         .parse::<Address>()
         .map_err(|_err| {
-            Web3ProxyError::BadRequest("Unable to parse admin_address as an Address".to_string())
+            Web3ProxyError::BadRequest("Unable to parse admin_address as an Address".into())
         })?;
 
     // Fetch the user_address parameter from the login string ... (as who we want to be logging in ...)
     let user_address: Vec<u8> = params
         .get("user_address")
         .ok_or_else(|| {
-            Web3ProxyError::BadRequest("Unable to find user_address key in request".to_string())
+            Web3ProxyError::BadRequest("Unable to find user_address key in request".into())
         })?
         .parse::<Address>()
         .map_err(|_err| {
-            Web3ProxyError::BadRequest("Unable to parse user_address as an Address".to_string())
+            Web3ProxyError::BadRequest("Unable to parse user_address as an Address".into())
         })?
         .to_fixed_bytes()
         .into();
@@ -281,10 +255,10 @@ pub async fn admin_login_get(
     // TODO: Only get the id, not the whole user object ...
     let user = user::Entity::find()
         .filter(user::Column::Address.eq(user_address))
-        .one(db_replica.conn())
+        .one(db_replica.as_ref())
         .await?
         .ok_or(Web3ProxyError::BadRequest(
-            "Could not find user in db".to_string(),
+            "Could not find user in db".into(),
         ))?;
 
     // TODO: Gotta check if encoding messes up things maybe ...
@@ -292,10 +266,10 @@ pub async fn admin_login_get(
     info!("Encoded admin address is: {:?}", admin_address);
     let admin = user::Entity::find()
         .filter(user::Column::Address.eq(admin_address))
-        .one(db_replica.conn())
+        .one(db_replica.as_ref())
         .await?
         .ok_or(Web3ProxyError::BadRequest(
-            "Could not find admin in db".to_string(),
+            "Could not find admin in db".into(),
         ))?;
 
     // Note that the admin is trying to log in as this user
@@ -380,23 +354,33 @@ pub async fn admin_login_post(
     // we can't trust that they didn't tamper with the message in some way. like some clients return it hex encoded
     // TODO: checking 0x seems fragile, but I think it will be fine. siwe message text shouldn't ever start with 0x
     let their_msg: Message = if payload.msg.starts_with("0x") {
-        let their_msg_bytes =
-            Bytes::from_str(&payload.msg).web3_context("parsing payload message")?;
+        let their_msg_bytes = Bytes::from_str(&payload.msg).map_err(|err| {
+            Web3ProxyError::BadRequest(
+                format!("error parsing payload message as Bytes: {}", err).into(),
+            )
+        })?;
 
         // TODO: lossy or no?
         String::from_utf8_lossy(their_msg_bytes.as_ref())
             .parse::<siwe::Message>()
-            .web3_context("parsing hex string message")?
+            .map_err(|err| {
+                Web3ProxyError::BadRequest(
+                    format!("error parsing bytes as siwe message: {}", err).into(),
+                )
+            })?
     } else {
-        payload
-            .msg
-            .parse::<siwe::Message>()
-            .web3_context("parsing string message")?
+        payload.msg.parse::<siwe::Message>().map_err(|err| {
+            Web3ProxyError::BadRequest(
+                format!("error parsing string as siwe message: {}", err).into(),
+            )
+        })?
     };
 
     // the only part of the message we will trust is their nonce
     // TODO: this is fragile. have a helper function/struct for redis keys
-    let login_nonce = UserBearerToken::from_str(&their_msg.nonce)?;
+    let login_nonce = UserBearerToken::from_str(&their_msg.nonce).map_err(|err| {
+        Web3ProxyError::BadRequest(format!("error parsing nonce: {}", err).into())
+    })?;
 
     // fetch the message we gave them from our database
     let db_replica = app
@@ -409,7 +393,7 @@ pub async fn admin_login_post(
     // TODO: Here we will need to re-find the parameter where the admin wants to log-in as the user ...
     let user_pending_login = pending_login::Entity::find()
         .filter(pending_login::Column::Nonce.eq(login_nonce_uuid))
-        .one(db_replica.conn())
+        .one(db_replica.as_ref())
         .await
         .web3_context("database error while finding pending_login")?
         .web3_context("login nonce not found")?;
@@ -461,13 +445,13 @@ pub async fn admin_login_post(
     // TODO: Right now this loads the whole admin. I assume we might want to load the user though (?) figure this out as we go along...
     let admin = user::Entity::find()
         .filter(user::Column::Address.eq(our_msg.address.as_ref()))
-        .one(db_replica.conn())
+        .one(db_replica.as_ref())
         .await?
         .web3_context("getting admin address")?;
 
     let imitating_user = user::Entity::find()
         .filter(user::Column::Id.eq(imitating_user_id))
-        .one(db_replica.conn())
+        .one(db_replica.as_ref())
         .await?
         .web3_context("admin address was not found!")?;
 
@@ -491,7 +475,7 @@ pub async fn admin_login_post(
     // the user is already registered
     let admin_rpc_key = rpc_key::Entity::find()
         .filter(rpc_key::Column::UserId.eq(admin.id))
-        .all(db_replica.conn())
+        .all(db_replica.as_ref())
         .await
         .web3_context("failed loading user's key")?;
 

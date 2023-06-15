@@ -1,5 +1,5 @@
-use crate::frontend::errors::{Web3ProxyError, Web3ProxyResult};
-use crate::response_cache::JsonRpcResponseData;
+use crate::errors::{Web3ProxyError, Web3ProxyResult};
+use crate::response_cache::JsonRpcResponseEnum;
 use derive_more::From;
 use ethers::prelude::ProviderError;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -8,15 +8,21 @@ use serde_json::json;
 use serde_json::value::{to_raw_value, RawValue};
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::Arc;
+
+pub trait JsonRpcParams = Clone + fmt::Debug + serde::Serialize + Send + Sync + 'static;
+pub trait JsonRpcResultData = serde::Serialize + serde::de::DeserializeOwned + fmt::Debug + Send;
 
 // TODO: &str here instead of String should save a lot of allocations
+// TODO: generic type for params?
 #[derive(Clone, Deserialize, Serialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     /// id could be a stricter type, but many rpcs do things against the spec
     pub id: Box<RawValue>,
     pub method: String,
-    pub params: Option<serde_json::Value>,
+    /// TODO: skip serializing if serde_json::Value::Null
+    pub params: serde_json::Value,
 }
 
 #[derive(From)]
@@ -27,7 +33,7 @@ pub enum JsonRpcId {
 }
 
 impl JsonRpcId {
-    pub fn to_raw_value(&self) -> Box<RawValue> {
+    pub fn to_raw_value(self) -> Box<RawValue> {
         // TODO: is this a good way to do this? we should probably use references
         match self {
             Self::None => {
@@ -36,17 +42,13 @@ impl JsonRpcId {
             Self::Number(x) => {
                 serde_json::from_value(json!(x)).expect("number id should always work")
             }
-            Self::String(x) => serde_json::from_str(x).expect("string id should always work"),
+            Self::String(x) => serde_json::from_str(&x).expect("string id should always work"),
         }
     }
 }
 
 impl JsonRpcRequest {
-    pub fn new(
-        id: JsonRpcId,
-        method: String,
-        params: Option<serde_json::Value>,
-    ) -> anyhow::Result<Self> {
+    pub fn new(id: JsonRpcId, method: String, params: serde_json::Value) -> anyhow::Result<Self> {
         let x = Self {
             jsonrpc: "2.0".to_string(),
             id: id.to_raw_value(),
@@ -77,6 +79,15 @@ pub enum JsonRpcRequestEnum {
     Single(JsonRpcRequest),
 }
 
+impl JsonRpcRequestEnum {
+    pub fn first_id(&self) -> Option<Box<RawValue>> {
+        match self {
+            Self::Batch(x) => x.first().map(|x| x.id.clone()),
+            Self::Single(x) => Some(x.id.clone()),
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for JsonRpcRequestEnum {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -89,7 +100,6 @@ impl<'de> Deserialize<'de> for JsonRpcRequestEnum {
             Id,
             Method,
             Params,
-            // TODO: jsonrpc here, too?
         }
 
         struct JsonRpcBatchVisitor;
@@ -162,16 +172,11 @@ impl<'de> Deserialize<'de> for JsonRpcRequestEnum {
                 let id = id.ok_or_else(|| de::Error::missing_field("id"))?;
                 let method = method.ok_or_else(|| de::Error::missing_field("method"))?;
 
-                let params: Option<serde_json::Value> = match params {
-                    None => Some(serde_json::Value::Array(vec![])),
-                    Some(x) => Some(x),
-                };
-
                 let single = JsonRpcRequest {
                     jsonrpc,
                     id,
                     method,
-                    params,
+                    params: params.unwrap_or_default(),
                 };
 
                 Ok(JsonRpcRequestEnum::Single(single))
@@ -201,7 +206,7 @@ impl From<&'static str> for JsonRpcErrorData {
     fn from(value: &'static str) -> Self {
         Self {
             code: -32000,
-            message: Cow::Borrowed(value),
+            message: value.into(),
             data: None,
         }
     }
@@ -211,7 +216,7 @@ impl From<String> for JsonRpcErrorData {
     fn from(value: String) -> Self {
         Self {
             code: -32000,
-            message: Cow::Owned(value),
+            message: value.into(),
             data: None,
         }
     }
@@ -225,7 +230,7 @@ pub struct JsonRpcForwardedResponse {
     pub jsonrpc: &'static str,
     pub id: Box<RawValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<Box<RawValue>>,
+    pub result: Option<Arc<RawValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcErrorData>,
 }
@@ -263,14 +268,14 @@ impl JsonRpcForwardedResponse {
             result: None,
             error: Some(JsonRpcErrorData {
                 code: code.unwrap_or(-32099),
-                message: Cow::Owned(message),
+                message: message.into(),
                 // TODO: accept data as an argument
                 data: None,
             }),
         }
     }
 
-    pub fn from_raw_response(result: Box<RawValue>, id: Box<RawValue>) -> Self {
+    pub fn from_raw_response(result: Arc<RawValue>, id: Box<RawValue>) -> Self {
         JsonRpcForwardedResponse {
             jsonrpc: "2.0",
             id,
@@ -282,6 +287,9 @@ impl JsonRpcForwardedResponse {
 
     pub fn from_value(result: serde_json::Value, id: Box<RawValue>) -> Self {
         let partial_response = to_raw_value(&result).expect("Value to RawValue should always work");
+
+        // TODO: an Arc is a waste here. change JsonRpcForwardedResponse to take an enum?
+        let partial_response = partial_response.into();
 
         JsonRpcForwardedResponse {
             jsonrpc: "2.0",
@@ -306,10 +314,7 @@ impl JsonRpcForwardedResponse {
                     data = err.data.clone();
                 } else if let Some(err) = err.as_serde_error() {
                     // this is not an rpc error. keep it as an error
-                    return Err(Web3ProxyError::BadResponse(format!(
-                        "bad response: {}",
-                        err
-                    )));
+                    return Err(Web3ProxyError::BadResponse(err.to_string().into()));
                 } else {
                     return Err(anyhow::anyhow!("unexpected ethers error! {:?}", err).into());
                 }
@@ -323,14 +328,14 @@ impl JsonRpcForwardedResponse {
             result: None,
             error: Some(JsonRpcErrorData {
                 code,
-                message: Cow::Owned(message),
+                message: message.into(),
                 data,
             }),
         })
     }
 
     pub fn try_from_response_result(
-        result: Result<Box<RawValue>, ProviderError>,
+        result: Result<Arc<RawValue>, ProviderError>,
         id: Box<RawValue>,
     ) -> Web3ProxyResult<Self> {
         match result {
@@ -339,10 +344,12 @@ impl JsonRpcForwardedResponse {
         }
     }
 
-    pub fn from_response_data(data: JsonRpcResponseData, id: Box<RawValue>) -> Self {
+    pub fn from_response_data(data: JsonRpcResponseEnum<Arc<RawValue>>, id: Box<RawValue>) -> Self {
         match data {
-            JsonRpcResponseData::Result { value, .. } => Self::from_raw_response(value, id),
-            JsonRpcResponseData::Error { value, .. } => JsonRpcForwardedResponse {
+            JsonRpcResponseEnum::Result { value, .. } => Self::from_raw_response(value, id),
+            JsonRpcResponseEnum::RpcError {
+                error_data: value, ..
+            } => JsonRpcForwardedResponse {
                 jsonrpc: "2.0",
                 id,
                 result: None,
@@ -373,7 +380,7 @@ mod tests {
 
         assert_eq!(output.id.to_string(), "1");
         assert_eq!(output.method, "eth_blockNumber");
-        assert_eq!(output.params.unwrap().to_string(), "[]");
+        assert_eq!(output.params.to_string(), "[]");
 
         // test deserializing it into an enum
         let output: JsonRpcRequestEnum = serde_json::from_str(input).unwrap();
@@ -393,7 +400,7 @@ mod tests {
         assert_eq!(output[0].id.to_string(), "27");
         assert_eq!(output[0].method, "eth_getCode");
         assert_eq!(
-            output[0].params.as_ref().unwrap().to_string(),
+            output[0].params.to_string(),
             r#"["0x5ba1e12693dc8f9c48aad8770482f4739beed696","0xe0e6a4"]"#
         );
 

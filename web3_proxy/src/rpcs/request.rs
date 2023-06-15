@@ -1,22 +1,23 @@
 use super::one::Web3Rpc;
-use crate::frontend::authorization::Authorization;
-use crate::frontend::errors::Web3ProxyResult;
+use crate::errors::Web3ProxyResult;
+use crate::frontend::authorization::{Authorization, AuthorizationType};
+use crate::jsonrpc::{JsonRpcParams, JsonRpcResultData};
 use anyhow::Context;
 use chrono::Utc;
+use derive_more::From;
 use entities::revert_log;
 use entities::sea_orm_active_enums::Method;
 use ethers::providers::ProviderError;
 use ethers::types::{Address, Bytes};
 use log::{debug, error, trace, warn, Level};
 use migration::sea_orm::{self, ActiveEnum, ActiveModelTrait};
+use nanorand::Rng;
 use serde_json::json;
-use std::fmt;
 use std::sync::atomic;
 use std::sync::Arc;
-use thread_fast_rng::rand::Rng;
 use tokio::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, From)]
 pub enum OpenRequestResult {
     Handle(OpenRequestHandle),
     /// Unable to start a request. Retry at the given time.
@@ -30,11 +31,12 @@ pub enum OpenRequestResult {
 #[derive(Debug)]
 pub struct OpenRequestHandle {
     authorization: Arc<Authorization>,
+    error_handler: RequestErrorHandler,
     rpc: Arc<Web3Rpc>,
 }
 
 /// Depending on the context, RPC errors require different handling.
-#[derive(Copy, Clone)]
+#[derive(Copy, Debug, Clone)]
 pub enum RequestErrorHandler {
     /// Log at the trace level. Use when errors are expected.
     TraceLevel,
@@ -46,6 +48,12 @@ pub enum RequestErrorHandler {
     WarnLevel,
     /// Potentially save the revert. Users can tune how often this happens
     Save,
+}
+
+impl Default for RequestErrorHandler {
+    fn default() -> Self {
+        Self::TraceLevel
+    }
 }
 
 // TODO: second param could be skipped since we don't need it here
@@ -130,14 +138,24 @@ impl Drop for OpenRequestHandle {
 }
 
 impl OpenRequestHandle {
-    pub async fn new(authorization: Arc<Authorization>, rpc: Arc<Web3Rpc>) -> Self {
+    pub async fn new(
+        authorization: Arc<Authorization>,
+        rpc: Arc<Web3Rpc>,
+        error_handler: Option<RequestErrorHandler>,
+    ) -> Self {
         // TODO: take request_id as an argument?
         // TODO: attach a unique id to this? customer requests have one, but not internal queries
         // TODO: what ordering?!
         rpc.active_requests
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
-        Self { authorization, rpc }
+        let error_handler = error_handler.unwrap_or_default();
+
+        Self {
+            authorization,
+            error_handler,
+            rpc,
+        }
     }
 
     pub fn connection_name(&self) -> String {
@@ -153,25 +171,28 @@ impl OpenRequestHandle {
     /// By having the request method here, we ensure that the rate limiter was called and connection counts were properly incremented
     /// depending on how things are locked, you might need to pass the provider in
     /// we take self to ensure this function only runs once
-    pub async fn request<P, R>(
+    pub async fn request<P: JsonRpcParams, R: JsonRpcResultData + serde::Serialize>(
         self,
         method: &str,
         params: &P,
-        mut error_handler: RequestErrorHandler,
-    ) -> Result<R, ProviderError>
-    where
-        // TODO: not sure about this type. would be better to not need clones, but measure and spawns combine to need it
-        P: Clone + fmt::Debug + serde::Serialize + Send + Sync + 'static,
-        R: serde::Serialize + serde::de::DeserializeOwned + fmt::Debug + Send,
-    {
+    ) -> Result<R, ProviderError> {
         // TODO: use tracing spans
         // TODO: including params in this log is way too verbose
         // trace!(rpc=%self.rpc, %method, "request");
         trace!("requesting from {}", self.rpc);
 
-        self.rpc
-            .total_requests
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        match self.authorization.authorization_type {
+            AuthorizationType::Frontend => {
+                self.rpc
+                    .external_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            AuthorizationType::Internal => {
+                self.rpc
+                    .internal_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         // we used to fetch_add the active_request count here, but sometimes a request is made without going through this function (like with subscriptions)
 
@@ -181,7 +202,7 @@ impl OpenRequestHandle {
         // TODO: replace ethers-rs providers with our own that handles "id" being null
         let response: Result<R, _> = if let Some(ref p) = self.rpc.http_provider {
             p.request(method, params).await
-        } else if let Some(ref p) = self.rpc.ws_provider {
+        } else if let Some(p) = self.rpc.ws_provider.load().as_ref() {
             p.request(method, params).await
         } else {
             return Err(ProviderError::CustomError(
@@ -205,7 +226,7 @@ impl OpenRequestHandle {
         if let Err(err) = &response {
             // only save reverts for some types of calls
             // TODO: do something special for eth_sendRawTransaction too
-            error_handler = if let RequestErrorHandler::Save = error_handler {
+            let error_handler = if let RequestErrorHandler::Save = self.error_handler {
                 // TODO: should all these be Trace or Debug or a mix?
                 if !["eth_call", "eth_estimateGas"].contains(&method) {
                     // trace!(%method, "skipping save on revert");
@@ -213,28 +234,27 @@ impl OpenRequestHandle {
                 } else if self.authorization.db_conn.is_some() {
                     let log_revert_chance = self.authorization.checks.log_revert_chance;
 
-                    if log_revert_chance == 0.0 {
+                    if log_revert_chance == 0 {
                         // trace!(%method, "no chance. skipping save on revert");
                         RequestErrorHandler::TraceLevel
-                    } else if log_revert_chance == 1.0 {
+                    } else if log_revert_chance == u16::MAX {
                         // trace!(%method, "gaurenteed chance. SAVING on revert");
-                        error_handler
-                    } else if thread_fast_rng::thread_fast_rng().gen_range(0.0f64..=1.0)
-                        < log_revert_chance
+                        self.error_handler
+                    } else if nanorand::tls_rng().generate_range(0u16..u16::MAX) < log_revert_chance
                     {
                         // trace!(%method, "missed chance. skipping save on revert");
                         RequestErrorHandler::TraceLevel
                     } else {
                         // trace!("Saving on revert");
                         // TODO: is always logging at debug level fine?
-                        error_handler
+                        self.error_handler
                     }
                 } else {
                     // trace!(%method, "no database. skipping save on revert");
                     RequestErrorHandler::TraceLevel
                 }
             } else {
-                error_handler
+                self.error_handler
             };
 
             // TODO: simple enum -> string derive?
@@ -297,6 +317,7 @@ impl OpenRequestHandle {
             }
 
             // TODO: think more about the method and param logs. those can be sensitive information
+            // we do **NOT** use self.error_handler here because it might have been modified
             match error_handler {
                 RequestErrorHandler::DebugLevel => {
                     // TODO: think about this revert check more. sometimes we might want reverts logged so this needs a flag

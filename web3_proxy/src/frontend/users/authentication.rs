@@ -1,7 +1,7 @@
 //! Handle registration, logins, and managing account data.
 use crate::app::Web3ProxyApp;
+use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResponse};
 use crate::frontend::authorization::{login_is_authorized, RpcSecretKey};
-use crate::frontend::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResponse};
 use crate::user_token::UserBearerToken;
 use crate::{PostLogin, PostLoginQuery};
 use axum::{
@@ -18,11 +18,11 @@ use entities::{balance, login, pending_login, referee, referrer, rpc_key, user};
 use ethers::{prelude::Address, types::Bytes};
 use hashbrown::HashMap;
 use http::StatusCode;
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use migration::sea_orm::prelude::{Decimal, Uuid};
 use migration::sea_orm::{
-    self, ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
-    TransactionTrait,
+    self, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel,
+    QueryFilter, TransactionTrait,
 };
 use serde_json::json;
 use siwe::{Message, VerificationOpts};
@@ -143,6 +143,54 @@ pub async fn user_login_get(
     Ok(message.into_response())
 }
 
+pub async fn register_new_user(
+    db_conn: &DatabaseConnection,
+    address: Address,
+) -> anyhow::Result<(user::Model, rpc_key::Model, balance::Model)> {
+    // all or nothing
+    let txn = db_conn.begin().await?;
+
+    // the only thing we need from them is an address
+    // everything else is optional
+    // TODO: different invite codes should allow different levels
+    // TODO: maybe decrement a count on the invite code?
+    // TODO: There will be two different transactions. The first one inserts the user, the second one marks the user as being referred
+    let new_user = user::ActiveModel {
+        address: sea_orm::Set(address.to_fixed_bytes().into()),
+        ..Default::default()
+    };
+
+    let new_user = new_user.insert(&txn).await?;
+
+    // create the user's first api key
+    let rpc_secret_key = RpcSecretKey::new();
+
+    let user_rpc_key = rpc_key::ActiveModel {
+        user_id: sea_orm::Set(new_user.id),
+        secret_key: sea_orm::Set(rpc_secret_key.into()),
+        description: sea_orm::Set(None),
+        ..Default::default()
+    };
+
+    let user_rpc_key = user_rpc_key
+        .insert(&txn)
+        .await
+        .web3_context("Failed saving new user key")?;
+
+    // create an empty balance entry
+    let user_balance = balance::ActiveModel {
+        user_id: sea_orm::Set(new_user.id),
+        ..Default::default()
+    };
+
+    let user_balance = user_balance.insert(&txn).await?;
+
+    // save the user and key and balance to the database
+    txn.commit().await?;
+
+    Ok((new_user, user_rpc_key, user_balance))
+}
+
 /// `POST /user/login` - Register or login by posting a signed "siwe" message.
 /// It is recommended to save the returned bearer token in a cookie.
 /// The bearer token can be used to authenticate other requests, such as getting the user's stats or modifying the user's profile.
@@ -196,7 +244,7 @@ pub async fn user_login_post(
 
     let user_pending_login = pending_login::Entity::find()
         .filter(pending_login::Column::Nonce.eq(login_nonce_uuid))
-        .one(db_replica.conn())
+        .one(db_replica.as_ref())
         .await
         .web3_context("database error while finding pending_login")?
         .web3_context("login nonce not found")?;
@@ -244,7 +292,7 @@ pub async fn user_login_post(
     // TODO: limit columns or load whole user?
     let caller = user::Entity::find()
         .filter(user::Column::Address.eq(our_msg.address.as_ref()))
-        .one(db_replica.conn())
+        .one(db_replica.as_ref())
         .await?;
 
     let db_conn = app.db_conn().web3_context("login requires a db")?;
@@ -264,62 +312,18 @@ pub async fn user_login_post(
                 }
             }
 
-            let txn = db_conn.begin().await?;
-
-            // First add a user
-
-            // the only thing we need from them is an address
-            // everything else is optional
-            // TODO: different invite codes should allow different levels
-            // TODO: maybe decrement a count on the invite code?
-            // TODO: There will be two different transactions. The first one inserts the user, the second one marks the user as being referred
-            let caller = user::ActiveModel {
-                address: sea_orm::Set(our_msg.address.into()),
-                ..Default::default()
-            };
-
-            let caller = caller.insert(&txn).await?;
-
-            // create the user's first api key
-            let rpc_secret_key = RpcSecretKey::new();
-
-            let user_rpc_key = rpc_key::ActiveModel {
-                user_id: sea_orm::Set(caller.id),
-                secret_key: sea_orm::Set(rpc_secret_key.into()),
-                description: sea_orm::Set(None),
-                ..Default::default()
-            };
-
-            let user_rpc_key = user_rpc_key
-                .insert(&txn)
-                .await
-                .web3_context("Failed saving new user key")?;
-
-            // We should also create the balance entry ...
-            let user_balance = balance::ActiveModel {
-                user_id: sea_orm::Set(caller.id),
-                available_balance: sea_orm::Set(Decimal::new(0, 0)),
-                used_balance: sea_orm::Set(Decimal::new(0, 0)),
-                ..Default::default()
-            };
-            user_balance.insert(&txn).await?;
-
-            let user_rpc_keys = vec![user_rpc_key];
-
-            // Also add a part for the invite code, i.e. who invited this guy
-
-            // save the user and key to the database
-            txn.commit().await?;
+            let (caller, caller_key, _) =
+                register_new_user(&db_conn, our_msg.address.into()).await?;
 
             let txn = db_conn.begin().await?;
             // First, optionally catch a referral code from the parameters if there is any
             debug!("Refferal code is: {:?}", payload.referral_code);
             if let Some(referral_code) = payload.referral_code.as_ref() {
                 // If it is not inside, also check in the database
-                warn!("Using register referral code:  {:?}", referral_code);
+                trace!("Using register referral code:  {:?}", referral_code);
                 let user_referrer = referrer::Entity::find()
                     .filter(referrer::Column::ReferralCode.eq(referral_code))
-                    .one(db_replica.conn())
+                    .one(db_replica.as_ref())
                     .await?
                     .ok_or(Web3ProxyError::UnknownReferralCode)?;
 
@@ -338,7 +342,7 @@ pub async fn user_login_post(
             }
             txn.commit().await?;
 
-            (caller, user_rpc_keys, StatusCode::CREATED)
+            (caller, vec![caller_key], StatusCode::CREATED)
         }
         Some(caller) => {
             // Let's say that a user that exists can actually also redeem a key in retrospect...
@@ -347,15 +351,18 @@ pub async fn user_login_post(
             // First, optionally catch a referral code from the parameters if there is any
             if let Some(referral_code) = payload.referral_code.as_ref() {
                 // If it is not inside, also check in the database
-                warn!("Using referral code: {:?}", referral_code);
+                trace!("Using referral code: {:?}", referral_code);
                 let user_referrer = referrer::Entity::find()
                     .filter(referrer::Column::ReferralCode.eq(referral_code))
-                    .one(db_replica.conn())
+                    .one(db_replica.as_ref())
                     .await?
-                    .ok_or(Web3ProxyError::BadRequest(format!(
-                        "The referral_link you provided does not exist {}",
-                        referral_code
-                    )))?;
+                    .ok_or(Web3ProxyError::BadRequest(
+                        format!(
+                            "The referral_link you provided does not exist {}",
+                            referral_code
+                        )
+                        .into(),
+                    ))?;
 
                 // Create a new item in the database,
                 // marking this guy as the referrer (and ignoring a duplicate insert, if there is any...)
@@ -375,7 +382,7 @@ pub async fn user_login_post(
             // the user is already registered
             let user_rpc_keys = rpc_key::Entity::find()
                 .filter(rpc_key::Column::UserId.eq(caller.id))
-                .all(db_replica.conn())
+                .all(db_replica.as_ref())
                 .await
                 .web3_context("failed loading user's key")?;
 

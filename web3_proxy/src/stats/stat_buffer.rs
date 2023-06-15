@@ -1,6 +1,6 @@
 use super::{AppStat, RpcQueryKey};
-use crate::app::{RpcSecretKeyCache, Web3ProxyJoinHandle};
-use crate::frontend::errors::Web3ProxyResult;
+use crate::app::{RpcSecretKeyCache, UserBalanceCache, Web3ProxyJoinHandle};
+use crate::errors::Web3ProxyResult;
 use derive_more::From;
 use futures::stream;
 use hashbrown::HashMap;
@@ -8,8 +8,9 @@ use influxdb2::api::write::TimestampPrecision;
 use log::{error, info, trace};
 use migration::sea_orm::prelude::Decimal;
 use migration::sea_orm::DatabaseConnection;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
 
 #[derive(Debug, Default)]
@@ -25,7 +26,7 @@ pub struct BufferedRpcQueryStats {
     pub sum_response_millis: u64,
     pub sum_credits_used: Decimal,
     /// Balance tells us the user's balance at this point in time
-    pub latest_balance: Decimal,
+    pub latest_balance: Arc<RwLock<Decimal>>,
 }
 
 #[derive(From)]
@@ -43,7 +44,8 @@ pub struct StatBuffer {
     global_timeseries_buffer: HashMap<RpcQueryKey, BufferedRpcQueryStats>,
     influxdb_client: Option<influxdb2::Client>,
     opt_in_timeseries_buffer: HashMap<RpcQueryKey, BufferedRpcQueryStats>,
-    rpc_secret_key_cache: Option<RpcSecretKeyCache>,
+    rpc_secret_key_cache: RpcSecretKeyCache,
+    user_balance_cache: UserBalanceCache,
     timestamp_precision: TimestampPrecision,
     tsdb_save_interval_seconds: u32,
 }
@@ -58,6 +60,7 @@ impl StatBuffer {
         db_save_interval_seconds: u32,
         influxdb_client: Option<influxdb2::Client>,
         rpc_secret_key_cache: Option<RpcSecretKeyCache>,
+        user_balance_cache: Option<UserBalanceCache>,
         shutdown_receiver: broadcast::Receiver<()>,
         tsdb_save_interval_seconds: u32,
     ) -> anyhow::Result<Option<SpawnedStatBuffer>> {
@@ -77,7 +80,8 @@ impl StatBuffer {
             global_timeseries_buffer: Default::default(),
             influxdb_client,
             opt_in_timeseries_buffer: Default::default(),
-            rpc_secret_key_cache,
+            rpc_secret_key_cache: rpc_secret_key_cache.unwrap(),
+            user_balance_cache: user_balance_cache.unwrap(),
             timestamp_precision,
             tsdb_save_interval_seconds,
         };
@@ -101,9 +105,6 @@ impl StatBuffer {
             interval(Duration::from_secs(self.tsdb_save_interval_seconds as u64));
         let mut db_save_interval =
             interval(Duration::from_secs(self.db_save_interval_seconds as u64));
-
-        // TODO: Somewhere here we should probably be updating the balance of the user
-        // And also update the credits used etc. for the referred user
 
         loop {
             tokio::select! {
@@ -135,14 +136,14 @@ impl StatBuffer {
                     }
                 }
                 _ = db_save_interval.tick() => {
-                    // info!("DB save internal tick");
+                    trace!("DB save internal tick");
                     let count = self.save_relational_stats().await;
                     if count > 0 {
                         trace!("Saved {} stats to the relational db", count);
                     }
                 }
                 _ = tsdb_save_interval.tick() => {
-                    // info!("TSDB save internal tick");
+                    trace!("TSDB save internal tick");
                     let count = self.save_tsdb_stats(&bucket).await;
                     if count > 0 {
                         trace!("Saved {} stats to the tsdb", count);
@@ -186,7 +187,8 @@ impl StatBuffer {
                         self.chain_id,
                         db_conn,
                         key,
-                        self.rpc_secret_key_cache.as_ref(),
+                        &self.rpc_secret_key_cache,
+                        &self.user_balance_cache,
                     )
                     .await
                 {
