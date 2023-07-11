@@ -1,17 +1,18 @@
 use super::{AppStat, RpcQueryKey};
-use crate::app::{RpcSecretKeyCache, UserBalanceCache, Web3ProxyJoinHandle};
+use crate::app::Web3ProxyJoinHandle;
+use crate::balance::Balance;
+use crate::caches::{RpcSecretKeyCache, UserBalanceCache};
 use crate::errors::Web3ProxyResult;
 use derive_more::From;
 use futures::stream;
 use hashbrown::HashMap;
 use influxdb2::api::write::TimestampPrecision;
-use log::{error, info, trace};
 use migration::sea_orm::prelude::Decimal;
 use migration::sea_orm::DatabaseConnection;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, RwLock};
-use tokio::time::interval;
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::time::{interval, sleep};
+use tracing::{error, info, trace};
 
 #[derive(Debug, Default)]
 pub struct BufferedRpcQueryStats {
@@ -25,16 +26,18 @@ pub struct BufferedRpcQueryStats {
     pub sum_response_bytes: u64,
     pub sum_response_millis: u64,
     pub sum_credits_used: Decimal,
-    /// Balance tells us the user's balance at this point in time
-    pub latest_balance: Arc<RwLock<Decimal>>,
+    pub sum_cu_used: Decimal,
+    /// The user's balance at this point in time. Multiple queries might be modifying it at once.
+    pub approximate_latest_balance_for_influx: Balance,
 }
 
 #[derive(From)]
 pub struct SpawnedStatBuffer {
-    pub stat_sender: flume::Sender<AppStat>,
+    pub stat_sender: mpsc::UnboundedSender<AppStat>,
     /// these handles are important and must be allowed to finish
     pub background_handle: Web3ProxyJoinHandle<()>,
 }
+
 pub struct StatBuffer {
     accounting_db_buffer: HashMap<RpcQueryKey, BufferedRpcQueryStats>,
     billing_period_seconds: i64,
@@ -42,35 +45,45 @@ pub struct StatBuffer {
     db_conn: Option<DatabaseConnection>,
     db_save_interval_seconds: u32,
     global_timeseries_buffer: HashMap<RpcQueryKey, BufferedRpcQueryStats>,
+    influxdb_bucket: Option<String>,
     influxdb_client: Option<influxdb2::Client>,
     opt_in_timeseries_buffer: HashMap<RpcQueryKey, BufferedRpcQueryStats>,
     rpc_secret_key_cache: RpcSecretKeyCache,
-    user_balance_cache: UserBalanceCache,
     timestamp_precision: TimestampPrecision,
     tsdb_save_interval_seconds: u32,
+    user_balance_cache: UserBalanceCache,
+
+    _flush_sender: mpsc::Sender<oneshot::Sender<(usize, usize)>>,
 }
 
 impl StatBuffer {
     #[allow(clippy::too_many_arguments)]
     pub fn try_spawn(
         billing_period_seconds: i64,
-        bucket: String,
         chain_id: u64,
         db_conn: Option<DatabaseConnection>,
         db_save_interval_seconds: u32,
-        influxdb_client: Option<influxdb2::Client>,
+        influxdb_bucket: Option<String>,
+        mut influxdb_client: Option<influxdb2::Client>,
         rpc_secret_key_cache: Option<RpcSecretKeyCache>,
         user_balance_cache: Option<UserBalanceCache>,
         shutdown_receiver: broadcast::Receiver<()>,
         tsdb_save_interval_seconds: u32,
+        flush_sender: mpsc::Sender<oneshot::Sender<(usize, usize)>>,
+        flush_receiver: mpsc::Receiver<oneshot::Sender<(usize, usize)>>,
     ) -> anyhow::Result<Option<SpawnedStatBuffer>> {
+        if influxdb_bucket.is_none() {
+            influxdb_client = None;
+        }
+
         if db_conn.is_none() && influxdb_client.is_none() {
             return Ok(None);
         }
 
-        let (stat_sender, stat_receiver) = flume::unbounded();
+        let (stat_sender, stat_receiver) = mpsc::unbounded_channel();
 
         let timestamp_precision = TimestampPrecision::Seconds;
+
         let mut new = Self {
             accounting_db_buffer: Default::default(),
             billing_period_seconds,
@@ -78,17 +91,20 @@ impl StatBuffer {
             db_conn,
             db_save_interval_seconds,
             global_timeseries_buffer: Default::default(),
+            influxdb_bucket,
             influxdb_client,
             opt_in_timeseries_buffer: Default::default(),
             rpc_secret_key_cache: rpc_secret_key_cache.unwrap(),
-            user_balance_cache: user_balance_cache.unwrap(),
             timestamp_precision,
             tsdb_save_interval_seconds,
+            user_balance_cache: user_balance_cache.unwrap(),
+            _flush_sender: flush_sender,
         };
 
         // any errors inside this task will cause the application to exit
+        // TODO? change this to the X and XTask pattern like the latency crate uses
         let handle = tokio::spawn(async move {
-            new.aggregate_and_save_loop(bucket, stat_receiver, shutdown_receiver)
+            new.aggregate_and_save_loop(stat_receiver, shutdown_receiver, flush_receiver)
                 .await
         });
 
@@ -97,9 +113,9 @@ impl StatBuffer {
 
     async fn aggregate_and_save_loop(
         &mut self,
-        bucket: String,
-        stat_receiver: flume::Receiver<AppStat>,
+        mut stat_receiver: mpsc::UnboundedReceiver<AppStat>,
         mut shutdown_receiver: broadcast::Receiver<()>,
+        mut flush_receiver: mpsc::Receiver<oneshot::Sender<(usize, usize)>>,
     ) -> Web3ProxyResult<()> {
         let mut tsdb_save_interval =
             interval(Duration::from_secs(self.tsdb_save_interval_seconds as u64));
@@ -108,29 +124,29 @@ impl StatBuffer {
 
         loop {
             tokio::select! {
-                stat = stat_receiver.recv_async() => {
+                stat = stat_receiver.recv() => {
                     // trace!("Received stat");
                     // save the stat to a buffer
                     match stat {
-                        Ok(AppStat::RpcQuery(stat)) => {
+                        Some(AppStat::RpcQuery(stat)) => {
                             if self.influxdb_client.is_some() {
                                 // TODO: round the timestamp at all?
 
                                 let global_timeseries_key = stat.global_timeseries_key();
 
-                                self.global_timeseries_buffer.entry(global_timeseries_key).or_default().add(stat.clone());
+                                self.global_timeseries_buffer.entry(global_timeseries_key).or_default().add(stat.clone()).await;
 
-                                if let Some(opt_in_timeseries_key) = stat.opt_in_timeseries_key() {
-                                    self.opt_in_timeseries_buffer.entry(opt_in_timeseries_key).or_default().add(stat.clone());
+                                if let Some(opt_in_timeseries_key) = stat.owned_timeseries_key() {
+                                    self.opt_in_timeseries_buffer.entry(opt_in_timeseries_key).or_default().add(stat.clone()).await;
                                 }
                             }
 
                             if self.db_conn.is_some() {
-                                self.accounting_db_buffer.entry(stat.accounting_key(self.billing_period_seconds)).or_default().add(stat);
+                                self.accounting_db_buffer.entry(stat.accounting_key(self.billing_period_seconds)).or_default().add(stat).await;
                             }
                         }
-                        Err(err) => {
-                            info!("error receiving stat: {}", err);
+                        None => {
+                            info!("error receiving stat");
                             break;
                         }
                     }
@@ -144,9 +160,34 @@ impl StatBuffer {
                 }
                 _ = tsdb_save_interval.tick() => {
                     trace!("TSDB save internal tick");
-                    let count = self.save_tsdb_stats(&bucket).await;
+                    let count = self.save_tsdb_stats().await;
                     if count > 0 {
                         trace!("Saved {} stats to the tsdb", count);
+                    }
+                }
+                x = flush_receiver.recv() => {
+                    match x {
+                        Some(x) => {
+                            trace!("flush");
+
+                            let tsdb_count = self.save_tsdb_stats().await;
+                            if tsdb_count > 0 {
+                                trace!("Flushed {} stats to the tsdb", tsdb_count);
+                            }
+
+                            let relational_count = self.save_relational_stats().await;
+                            if relational_count > 0 {
+                                trace!("Flushed {} stats to the relational db", relational_count);
+                            }
+
+                            if let Err(err) = x.send((tsdb_count, relational_count)) {
+                                error!(%tsdb_count, %relational_count, ?err, "unable to notify about flushed stats");
+                            }
+                        }
+                        None => {
+                            error!("unable to flush stat buffer!");
+                            break;
+                        }
                     }
                 }
                 x = shutdown_receiver.recv() => {
@@ -161,11 +202,27 @@ impl StatBuffer {
             }
         }
 
+        // TODO: wait on all websockets to close
+        // TODO: wait on all pending external requests to finish
+        info!("waiting 10 seconds for remaining stats to arrive");
+        sleep(Duration::from_secs(10)).await;
+
+        // loop {
+        //     // nope. this won't ever be true because we keep making stats for internal requests
+        //     // if stat_receiver.is_disconnected() {
+        //     //     info!("stat_receiver is disconnected");
+        //     //     break;
+        //     // }
+
+        //     // TODO: don't just sleep. watch a channel
+        //     sleep(Duration::from_millis(10)).await;
+        // }
+
         let saved_relational = self.save_relational_stats().await;
 
         info!("saved {} pending relational stat(s)", saved_relational);
 
-        let saved_tsdb = self.save_tsdb_stats(&bucket).await;
+        let saved_tsdb = self.save_tsdb_stats().await;
 
         info!("saved {} pending tsdb stat(s)", saved_tsdb);
 
@@ -192,7 +249,7 @@ impl StatBuffer {
                     )
                     .await
                 {
-                    error!("unable to save accounting entry! err={:?}", err);
+                    error!(?err, "unable to save accounting entry!");
                 };
             }
         }
@@ -201,10 +258,15 @@ impl StatBuffer {
     }
 
     // TODO: bucket should be an enum so that we don't risk typos
-    async fn save_tsdb_stats(&mut self, bucket: &str) -> usize {
+    async fn save_tsdb_stats(&mut self) -> usize {
         let mut count = 0;
 
         if let Some(influxdb_client) = self.influxdb_client.as_ref() {
+            let influxdb_bucket = self
+                .influxdb_bucket
+                .as_ref()
+                .expect("if client is set, bucket must be set");
+
             // TODO: use stream::iter properly to avoid allocating this Vec
             let mut points = vec![];
 
@@ -218,7 +280,7 @@ impl StatBuffer {
                         points.push(point);
                     }
                     Err(err) => {
-                        error!("unable to build global stat! err={:?}", err);
+                        error!(?err, "unable to build global stat!");
                     }
                 };
             }
@@ -258,14 +320,15 @@ impl StatBuffer {
 
                     if let Err(err) = influxdb_client
                         .write_with_precision(
-                            bucket,
+                            influxdb_bucket,
                             stream::iter(points),
                             self.timestamp_precision,
                         )
                         .await
                     {
                         // TODO: if this errors, we throw away some of the pending stats! we should probably buffer them somewhere to be tried again
-                        error!("unable to save {} tsdb stats! err={:?}", batch_size, err);
+                        error!(?err, batch_size, "unable to save tsdb stats!");
+                        // TODO: we should probably wait a second to give errors a chance to settle
                     }
 
                     points = p;

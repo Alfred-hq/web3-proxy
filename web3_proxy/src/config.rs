@@ -2,14 +2,17 @@ use crate::app::Web3ProxyJoinHandle;
 use crate::rpcs::blockchain::{BlocksByHashCache, Web3ProxyBlock};
 use crate::rpcs::one::Web3Rpc;
 use argh::FromArgs;
-use ethers::prelude::{Address, TxHash, H256};
+use ethers::prelude::{Address, TxHash};
 use ethers::types::{U256, U64};
 use hashbrown::HashMap;
-use log::warn;
 use migration::sea_orm::DatabaseConnection;
+use sentry::types::Dsn;
 use serde::Deserialize;
+use serde_inline_default::serde_inline_default;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::warn;
 
 pub type BlockAndRpc = (Option<Web3ProxyBlock>, Arc<Web3Rpc>);
 pub type TxHashAndRpc = (TxHash, Arc<Web3Rpc>);
@@ -51,20 +54,25 @@ pub struct TopConfig {
 
 /// shared configuration between Web3Rpcs
 // TODO: no String, only &str
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde_inline_default]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     /// Request limit for allowed origins for anonymous users.
     /// These requests get rate limited by IP.
-    #[serde(default = "default_allowed_origin_requests_per_period")]
+    #[serde(default = "Default::default")]
     pub allowed_origin_requests_per_period: HashMap<String, u64>,
 
     /// erigon defaults to pruning beyond 90,000 blocks
-    #[serde(default = "default_archive_depth")]
+    #[serde_inline_default(90_000u64)]
     pub archive_depth: u64,
 
     /// EVM chain id. 1 for ETH
     /// TODO: better type for chain_id? max of `u64::MAX / 2 - 36` <https://github.com/ethereum/EIPs/issues/2294>
+    #[serde_inline_default(1u64)]
     pub chain_id: u64,
+
+    /// Cost per computational unit
+    // pub cost_per_cu: Decimal,
 
     /// Database is used for user data.
     /// Currently supports mysql or compatible backend.
@@ -97,9 +105,6 @@ pub struct AppConfig {
     /// Default ERC address for out deposit contract
     pub deposit_factory_contract: Option<Address>,
 
-    /// Default ERC address for out deposit contract
-    pub deposit_topic: Option<H256>,
-
     /// minimum amount to increase eth_estimateGas results
     pub gas_increase_min: Option<U256>,
 
@@ -114,34 +119,26 @@ pub struct AppConfig {
     /// Used by /debug/:rpc_key urls for logging requests and responses. No other endpoints log request/response data.
     pub kafka_urls: Option<String>,
 
-    #[serde(default = "default_kafka_protocol")]
+    #[serde_inline_default("ssl".to_string())]
     pub kafka_protocol: String,
 
     /// domain in sign-in-with-ethereum messages
     pub login_domain: Option<String>,
 
-    /// do not serve any requests if the best known block is older than this many seconds.
-    pub max_block_age: Option<u64>,
-
     /// do not serve any requests if the best known block is behind the best known block by more than this many blocks.
-    pub max_block_lag: Option<U64>,
-
-    /// Rate limit for bearer token authenticated entrypoints.
-    /// This is separate from the rpc limits.
-    #[serde(default = "default_bearer_token_max_concurrent_requests")]
-    pub bearer_token_max_concurrent_requests: u64,
+    pub max_head_block_lag: Option<U64>,
 
     /// Rate limit for the login entrypoint.
     /// This is separate from the rpc limits.
-    #[serde(default = "default_login_rate_limit_per_period")]
+    #[serde_inline_default(10u64)]
     pub login_rate_limit_per_period: u64,
 
     /// The soft limit prevents thundering herds as new blocks are seen.
-    #[serde(default = "default_min_sum_soft_limit")]
+    #[serde_inline_default(1u32)]
     pub min_sum_soft_limit: u32,
 
     /// Another knob for preventing thundering herds as new blocks are seen.
-    #[serde(default = "default_min_synced_rpcs")]
+    #[serde_inline_default(1usize)]
     pub min_synced_rpcs: usize,
 
     /// Concurrent request limit for anonymous users.
@@ -158,7 +155,7 @@ pub struct AppConfig {
     pub public_recent_ips_salt: Option<String>,
 
     /// RPC responses are cached locally
-    #[serde(default = "default_response_cache_max_bytes")]
+    #[serde_inline_default(10u64.pow(8))]
     pub response_cache_max_bytes: u64,
 
     /// the stats page url for an anonymous user.
@@ -168,7 +165,10 @@ pub struct AppConfig {
     pub redirect_rpc_key_url: Option<String>,
 
     /// Optionally send errors to <https://sentry.io>
-    pub sentry_url: Option<String>,
+    pub sentry_url: Option<Dsn>,
+
+    /// Stripe api key for checking validity of webhooks
+    pub stripe_whsec_key: Option<String>,
 
     /// Track rate limits in a redis (or compatible backend)
     /// It is okay if this data is lost.
@@ -195,54 +195,48 @@ pub struct AppConfig {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-fn default_archive_depth() -> u64 {
-    90_000
+impl Default for AppConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").unwrap()
+    }
 }
 
-fn default_allowed_origin_requests_per_period() -> HashMap<String, u64> {
-    HashMap::new()
-}
-
-/// This might cause a thundering herd!
-fn default_min_sum_soft_limit() -> u32 {
-    1
-}
-
-/// Only require 1 server. This might cause a thundering herd!
-fn default_min_synced_rpcs() -> usize {
-    1
-}
-
-/// Having a low amount of concurrent requests for bearer tokens keeps us from hammering the database.
-fn default_bearer_token_max_concurrent_requests() -> u64 {
-    2
-}
-
-/// Having a low amount of requests per period (usually minute) for login is safest.
-fn default_login_rate_limit_per_period() -> u64 {
-    10
-}
-
-fn default_kafka_protocol() -> String {
-    "ssl".to_string()
-}
-
-fn default_response_cache_max_bytes() -> u64 {
-    // TODO: default to some percentage of the system?
-    // 100 megabytes
-    10u64.pow(8)
+/// TODO: we can't query a provider because we need this to create a provider
+pub fn average_block_interval(chain_id: u64) -> Duration {
+    match chain_id {
+        // ethereum
+        1 => Duration::from_secs(12),
+        // ethereum-goerli
+        5 => Duration::from_secs(12),
+        // binance
+        56 => Duration::from_secs(3),
+        // polygon
+        137 => Duration::from_secs(2),
+        // fantom
+        250 => Duration::from_secs(1),
+        // arbitrum
+        42161 => Duration::from_millis(500),
+        // anything else
+        _ => {
+            let default = 10;
+            warn!(
+                "unknown chain_id ({}). defaulting average_block_interval to {} seconds",
+                chain_id, default
+            );
+            Duration::from_secs(default)
+        }
+    }
 }
 
 /// Configuration for a backend web3 RPC server
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde_inline_default]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct Web3RpcConfig {
     /// simple way to disable a connection without deleting the row
-    #[serde(default)]
+    #[serde(default = "Default::default")]
     pub disabled: bool,
     /// a name used in /status and other user facing messages
     pub display_name: Option<String>,
-    /// (deprecated) rpc url
-    pub url: Option<String>,
     /// while not absolutely required, a ws:// or wss:// connection will be able to subscribe to head blocks
     pub ws_url: Option<String>,
     /// while not absolutely required, a http:// or https:// connection will allow erigon to stream JSON
@@ -250,19 +244,26 @@ pub struct Web3RpcConfig {
     /// block data limit. If None, will be queried
     pub block_data_limit: Option<u64>,
     /// the requests per second at which the server starts slowing down
+    #[serde_inline_default(1u32)]
     pub soft_limit: u32,
     /// the requests per second at which the server throws errors (rate limit or otherwise)
     pub hard_limit: Option<u64>,
     /// only use this rpc if everything else is lagging too far. this allows us to ignore fast but very low limit rpcs
-    #[serde(default)]
+    #[serde(default = "Default::default")]
     pub backup: bool,
     /// Subscribe to the firehose of pending transactions
     /// Don't do this with free rpcs
-    #[serde(default)]
+    #[serde(default = "Default::default")]
     pub subscribe_txs: bool,
     /// unknown config options get put here
     #[serde(flatten, default = "HashMap::default")]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl Default for Web3RpcConfig {
+    fn default() -> Self {
+        serde_json::from_str("{}").unwrap()
+    }
 }
 
 impl Web3RpcConfig {
@@ -275,39 +276,16 @@ impl Web3RpcConfig {
         db_conn: Option<DatabaseConnection>,
         redis_pool: Option<redis_rate_limiter::RedisPool>,
         chain_id: u64,
+        block_interval: Duration,
         http_client: Option<reqwest::Client>,
         blocks_by_hash_cache: BlocksByHashCache,
-        block_sender: Option<flume::Sender<BlockAndRpc>>,
-        tx_id_sender: Option<flume::Sender<TxHashAndRpc>>,
+        block_sender: Option<mpsc::UnboundedSender<BlockAndRpc>>,
+        max_head_block_age: Duration,
+        tx_id_sender: Option<mpsc::UnboundedSender<TxHashAndRpc>>,
     ) -> anyhow::Result<(Arc<Web3Rpc>, Web3ProxyJoinHandle<()>)> {
         if !self.extra.is_empty() {
-            warn!("unknown Web3RpcConfig fields!: {:?}", self.extra.keys());
+            warn!(extra=?self.extra.keys(), "unknown Web3RpcConfig fields!");
         }
-
-        // TODO: get this from config? a helper function? where does this belong?
-        let block_interval = match chain_id {
-            // ethereum
-            1 => Duration::from_secs(12),
-            // ethereum-goerli
-            5 => Duration::from_secs(12),
-            // binance
-            56 => Duration::from_secs(3),
-            // polygon
-            137 => Duration::from_secs(2),
-            // fantom
-            250 => Duration::from_secs(1),
-            // arbitrum
-            42161 => Duration::from_millis(500),
-            // anything else
-            _ => {
-                let default = 10;
-                warn!(
-                    "unknown chain_id ({}). defaulting polling every {} seconds",
-                    chain_id, default
-                );
-                Duration::from_secs(default)
-            }
-        };
 
         Web3Rpc::spawn(
             self,
@@ -319,8 +297,44 @@ impl Web3RpcConfig {
             block_interval,
             blocks_by_hash_cache,
             block_sender,
+            max_head_block_age,
             tx_id_sender,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppConfig, Web3RpcConfig};
+    use serde_json::json;
+
+    #[test]
+    fn expected_app_defaults() {
+        let a: AppConfig = serde_json::from_value(json!({
+            "chain_id": 1,
+        }))
+        .unwrap();
+
+        assert_eq!(a.min_synced_rpcs, 1);
+
+        let b: AppConfig = Default::default();
+
+        assert_eq!(b.min_synced_rpcs, 1);
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn expected_rpc_defaults() {
+        let a: Web3RpcConfig = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(a.soft_limit, 1);
+
+        let b: Web3RpcConfig = Default::default();
+
+        assert_eq!(b.soft_limit, 1);
+
+        assert_eq!(a, b);
     }
 }

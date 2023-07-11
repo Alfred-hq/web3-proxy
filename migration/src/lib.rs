@@ -29,6 +29,14 @@ mod m20230511_161214_remove_columns_statsv2_origin_and_method;
 mod m20230512_220213_allow_null_rpc_key_id_in_stats_v2;
 mod m20230514_114803_admin_add_credits;
 mod m20230607_221917_total_deposits;
+mod m20230615_221201_handle_payment_uncles;
+mod m20230618_230611_longer_payload;
+mod m20230619_172237_default_tracking;
+mod m20230622_104142_stripe_deposits;
+mod m20230705_214013_type_fixes;
+mod m20230707_211936_premium_tier_changes;
+mod m20230708_151756_rpc_accounting_free_usage_credits;
+mod m20230708_152131_referral_track_one_time_bonus_bonus;
 
 pub struct Migrator;
 
@@ -65,6 +73,14 @@ impl MigratorTrait for Migrator {
             Box::new(m20230512_220213_allow_null_rpc_key_id_in_stats_v2::Migration),
             Box::new(m20230514_114803_admin_add_credits::Migration),
             Box::new(m20230607_221917_total_deposits::Migration),
+            Box::new(m20230615_221201_handle_payment_uncles::Migration),
+            Box::new(m20230618_230611_longer_payload::Migration),
+            Box::new(m20230619_172237_default_tracking::Migration),
+            Box::new(m20230622_104142_stripe_deposits::Migration),
+            Box::new(m20230705_214013_type_fixes::Migration),
+            Box::new(m20230707_211936_premium_tier_changes::Migration),
+            Box::new(m20230708_151756_rpc_accounting_free_usage_credits::Migration),
+            Box::new(m20230708_152131_referral_track_one_time_bonus_bonus::Migration),
         ]
     }
 }

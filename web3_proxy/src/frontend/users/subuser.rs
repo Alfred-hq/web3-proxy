@@ -11,11 +11,10 @@ use axum::{
 };
 use axum_macros::debug_handler;
 use entities::sea_orm_active_enums::Role;
-use entities::{balance, rpc_key, secondary_user, user};
+use entities::{rpc_key, secondary_user, user};
 use ethers::types::Address;
 use hashbrown::HashMap;
 use http::StatusCode;
-use log::trace;
 use migration::sea_orm;
 use migration::sea_orm::ActiveModelTrait;
 use migration::sea_orm::ColumnTrait;
@@ -25,6 +24,7 @@ use migration::sea_orm::QueryFilter;
 use migration::sea_orm::TransactionTrait;
 use serde_json::json;
 use std::sync::Arc;
+use tracing::trace;
 use ulid::{self, Ulid};
 
 pub async fn get_keys_as_subuser(
@@ -33,11 +33,9 @@ pub async fn get_keys_as_subuser(
     Query(_params): Query<HashMap<String, String>>,
 ) -> Web3ProxyResponse {
     // First, authenticate
-    let (subuser, _semaphore) = app.bearer_is_authorized(bearer).await?;
+    let subuser = app.bearer_is_authorized(bearer).await?;
 
-    let db_replica = app
-        .db_replica()
-        .context("getting replica db for user's revert logs")?;
+    let db_replica = app.db_replica()?;
 
     // TODO: JOIN over RPC_KEY, SUBUSER, PRIMARY_USER and return these items
 
@@ -68,17 +66,19 @@ pub async fn get_keys_as_subuser(
 
     // Now return the list
     let response_json = json!({
-        "subuser": format!("{:?}", Address::from_slice(&subuser.address)),
+        "subuser": Address::from_slice(&subuser.address),
         "rpc_keys": rpc_key_entities
             .into_iter()
             .flat_map(|(rpc_key, rpc_owner)| {
                 match rpc_owner {
                     Some(inner_rpc_owner) => {
-                        let mut tmp = HashMap::new();
-                        tmp.insert("rpc-key", serde_json::Value::String(Ulid::from(rpc_key.secret_key).to_string()));
-                        tmp.insert("rpc-owner", serde_json::Value::String(format!("{:?}", Address::from_slice(&inner_rpc_owner.address))));
-                        tmp.insert("role", serde_json::Value::String(format!("{:?}", secondary_user_entities.get(&rpc_key.id).unwrap().role))); // .to_string() returns ugly "'...'"
-                        Some(tmp)
+                        let x = json!({
+                            "rpc-key": Ulid::from(rpc_key.secret_key),
+                            "rpc-owner": Address::from_slice(&inner_rpc_owner.address),
+                            // TODO: prettier serialize for role
+                            "role": format!("{:?}", secondary_user_entities.get(&rpc_key.id).unwrap().role),
+                        });
+                        Some(x)
                     },
                     None => {
                         // error!("Found RPC secret key with no user!".to_owned());
@@ -98,11 +98,9 @@ pub async fn get_subusers(
     Query(mut params): Query<HashMap<String, String>>,
 ) -> Web3ProxyResponse {
     // First, authenticate
-    let (user, _semaphore) = app.bearer_is_authorized(bearer).await?;
+    let user = app.bearer_is_authorized(bearer).await?;
 
-    let db_replica = app
-        .db_replica()
-        .context("getting replica db for user's revert logs")?;
+    let db_replica = app.db_replica()?;
 
     let rpc_key: u64 = params
         .remove("key_id")
@@ -148,16 +146,16 @@ pub async fn get_subusers(
 
     // Now return the list
     let response_json = json!({
-        "caller": format!("{:?}", Address::from_slice(&user.address)),
+        "caller": Address::from_slice(&user.address),
         "rpc_key": rpc_key,
         "subusers": subusers
             .into_iter()
             .map(|subuser| {
-                let mut tmp = HashMap::new();
-                // .encode_hex()
-                tmp.insert("address", serde_json::Value::String(format!("{:?}", Address::from_slice(&subuser.address))));
-                tmp.insert("role", serde_json::Value::String(format!("{:?}", secondary_user_entities.get(&subuser.id).unwrap().role)));
-                json!(tmp)
+                json!({
+                    "address": Address::from_slice(&subuser.address),
+                    // TODO: prettier serialize for role
+                    "role": format!("{:?}", secondary_user_entities.get(&subuser.id).unwrap().role),
+                })
             })
             .collect::<Vec::<_>>(),
     });
@@ -172,11 +170,9 @@ pub async fn modify_subuser(
     Query(mut params): Query<HashMap<String, String>>,
 ) -> Web3ProxyResponse {
     // First, authenticate
-    let (user, _semaphore) = app.bearer_is_authorized(bearer).await?;
+    let user = app.bearer_is_authorized(bearer).await?;
 
-    let db_replica = app
-        .db_replica()
-        .context("getting replica db for user's revert logs")?;
+    let db_replica = app.db_replica()?;
 
     trace!("Parameters are: {:?}", params);
 
@@ -260,7 +256,7 @@ pub async fn modify_subuser(
     }
 
     // TODO: There is a good chunk of duplicate logic as login-post. Consider refactoring ...
-    let db_conn = app.db_conn().web3_context("login requires a db")?;
+    let db_conn = app.db_conn()?;
     let (subuser, _subuser_rpc_keys, _status_code) = match subuser {
         None => {
             let txn = db_conn.begin().await?;
@@ -288,12 +284,6 @@ pub async fn modify_subuser(
                 .await
                 .web3_context("Failed saving new user key")?];
 
-            // We should also create the balance entry ...
-            let subuser_balance = balance::ActiveModel {
-                user_id: sea_orm::Set(subuser.id),
-                ..Default::default()
-            };
-            subuser_balance.insert(&txn).await?;
             // save the user and key to the database
             txn.commit().await?;
 
@@ -342,12 +332,12 @@ pub async fn modify_subuser(
             let mut active_subuser_entry_secondary_user = secondary_user.into_active_model();
             if !keep_subuser {
                 // Remove the user
-                active_subuser_entry_secondary_user.delete(&db_conn).await?;
+                active_subuser_entry_secondary_user.delete(db_conn).await?;
                 action = "removed";
             } else {
                 // Just change the role
                 active_subuser_entry_secondary_user.role = sea_orm::Set(new_role.clone());
-                active_subuser_entry_secondary_user.save(&db_conn).await?;
+                active_subuser_entry_secondary_user.save(db_conn).await?;
                 action = "role modified";
             }
         }

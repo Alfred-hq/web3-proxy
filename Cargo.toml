@@ -20,3 +20,4 @@ inherits = "release"
 
 # spend longer compiling for a slightly faster binary
 codegen-units = 1
+ 

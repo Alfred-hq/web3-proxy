@@ -30,7 +30,7 @@ pub async fn user_revert_logs_get(
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Web3ProxyResponse {
-    let (user, _semaphore) = app.bearer_is_authorized(bearer).await?;
+    let user = app.bearer_is_authorized(bearer).await?;
 
     let chain_id = get_chain_id_from_params(app.as_ref(), &params)?;
     let query_start = get_query_start_from_params(&params)?;
@@ -46,9 +46,7 @@ pub async fn user_revert_logs_get(
     response.insert("chain_id", json!(chain_id));
     response.insert("query_start", json!(query_start.timestamp() as u64));
 
-    let db_replica = app
-        .db_replica()
-        .web3_context("getting replica db for user's revert logs")?;
+    let db_replica = app.db_replica()?;
 
     let uks = rpc_key::Entity::find()
         .filter(rpc_key::Column::UserId.eq(user.id))

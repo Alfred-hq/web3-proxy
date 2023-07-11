@@ -1,8 +1,8 @@
-use std::str::FromStr;
-
 use axum::headers::authorization::Bearer;
 use migration::sea_orm::prelude::Uuid;
 use serde::Serialize;
+use std::fmt;
+use std::str::FromStr;
 use ulid::Ulid;
 
 /// Key used for caching the user's login
@@ -45,6 +45,12 @@ impl From<Ulid> for UserBearerToken {
 impl From<UserBearerToken> for Uuid {
     fn from(x: UserBearerToken) -> Self {
         x.uuid()
+    }
+}
+
+impl fmt::Display for UserBearerToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 

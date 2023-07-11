@@ -14,12 +14,13 @@ use futures::future::AbortHandle;
 use futures::future::Abortable;
 use futures::stream::StreamExt;
 use http::StatusCode;
-use log::{error, trace};
 use serde_json::json;
 use std::sync::atomic::{self, AtomicU64};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_stream::wrappers::{BroadcastStream, WatchStream};
+use tracing::{error, trace};
 
 impl Web3ProxyApp {
     pub async fn eth_subscribe<'a>(
@@ -28,7 +29,7 @@ impl Web3ProxyApp {
         jsonrpc_request: JsonRpcRequest,
         subscription_count: &'a AtomicU64,
         // TODO: taking a sender for Message instead of the exact json we are planning to send feels wrong, but its easier for now
-        response_sender: flume::Sender<Message>,
+        response_sender: mpsc::UnboundedSender<Message>,
     ) -> Web3ProxyResult<(AbortHandle, JsonRpcForwardedResponse)> {
         let request_metadata = RequestMetadata::new(
             self,
@@ -79,7 +80,7 @@ impl Web3ProxyApp {
                         &app,
                         authorization.clone(),
                         RequestOrMethod::Method("eth_subscribe(newHeads)", 0),
-                        Some(new_head.number()),
+                        Some(&new_head),
                     )
                     .await;
 
@@ -87,7 +88,7 @@ impl Web3ProxyApp {
                         .rate_limit_close_websocket(&subscription_request_metadata)
                         .await
                     {
-                        let _ = response_sender.send_async(close_message).await;
+                        let _ = response_sender.send(close_message);
                         break;
                     }
 
@@ -112,7 +113,7 @@ impl Web3ProxyApp {
                     // TODO: can we check a content type header?
                     let response_msg = Message::Text(response_str);
 
-                    if response_sender.send_async(response_msg).await.is_err() {
+                    if response_sender.send(response_msg).is_err() {
                         // TODO: increment error_response? i don't think so. i think this will happen once every time a client disconnects.
                         // TODO: cancel this subscription earlier? select on head_block_receiver.next() and an abort handle?
                         break;
@@ -151,7 +152,7 @@ impl Web3ProxyApp {
                         .rate_limit_close_websocket(&subscription_request_metadata)
                         .await
                     {
-                        let _ = response_sender.send_async(close_message).await;
+                        let _ = response_sender.send(close_message);
                         break;
                     }
 
@@ -182,7 +183,7 @@ impl Web3ProxyApp {
                     // TODO: do clients support binary messages? reply with binary if thats what we were sent
                     let response_msg = Message::Text(response_str);
 
-                    if response_sender.send_async(response_msg).await.is_err() {
+                    if response_sender.send(response_msg).is_err() {
                         // TODO: cancel this subscription earlier? select on head_block_receiver.next() and an abort handle?
                         break;
                     };
@@ -222,7 +223,7 @@ impl Web3ProxyApp {
                         .rate_limit_close_websocket(&subscription_request_metadata)
                         .await
                     {
-                        let _ = response_sender.send_async(close_message).await;
+                        let _ = response_sender.send(close_message);
                         break;
                     }
 
@@ -251,7 +252,7 @@ impl Web3ProxyApp {
                     // TODO: do clients support binary messages?
                     let response_msg = Message::Text(response_str);
 
-                    if response_sender.send_async(response_msg).await.is_err() {
+                    if response_sender.send(response_msg).is_err() {
                         // TODO: cancel this subscription earlier? select on head_block_receiver.next() and an abort handle?
                         break;
                     };
@@ -291,7 +292,7 @@ impl Web3ProxyApp {
                         .rate_limit_close_websocket(&subscription_request_metadata)
                         .await
                     {
-                        let _ = response_sender.send_async(close_message).await;
+                        let _ = response_sender.send(close_message);
                         break;
                     }
 
@@ -321,7 +322,7 @@ impl Web3ProxyApp {
                     // TODO: do clients support binary messages?
                     let response_msg = Message::Text(response_str);
 
-                    if response_sender.send_async(response_msg).await.is_err() {
+                    if response_sender.send(response_msg).is_err() {
                         // TODO: cancel this subscription earlier? select on head_block_receiver.next() and an abort handle?
                         break;
                     };
@@ -335,7 +336,9 @@ impl Web3ProxyApp {
                 );
             });
         } else {
-            return Err(Web3ProxyError::NotImplemented);
+            return Err(Web3ProxyError::NotImplemented(
+                subscribe_to.to_owned().into(),
+            ));
         }
 
         // TODO: do something with subscription_join_handle?

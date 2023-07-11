@@ -1,6 +1,4 @@
 use crate::config::TopConfig;
-use gethostname::gethostname;
-use log::{debug, error, warn};
 use pagerduty_rs::eventsv2sync::EventsV2 as PagerdutySyncEventsV2;
 use pagerduty_rs::types::{AlertTrigger, AlertTriggerPayload, Event};
 use serde::Serialize;
@@ -10,7 +8,8 @@ use std::{
     hash::{Hash, Hasher},
     panic::PanicInfo,
 };
-use time::OffsetDateTime;
+use time_03::OffsetDateTime;
+use tracing::{debug, error, warn};
 
 /*
 
@@ -24,7 +23,7 @@ use time::OffsetDateTime;
             .and_then(|x| x.app.redirect_public_url.clone());
 
         panic::set_hook(Box::new(move |x| {
-            let hostname = gethostname().into_string().unwrap_or("unknown".to_string());
+            let hostname = hostname.get().into_string().unwrap_or("unknown".to_string());
             let panic_msg = format!("{} {:?}", x, x);
 
             if panic_msg.starts_with("panicked at 'WS Server panic") {
@@ -113,7 +112,7 @@ pub fn panic_handler(
     let event = Event::AlertTrigger(alert);
 
     if let Err(err) = pagerduty_sync.event(event) {
-        error!("Failed sending alert to pagerduty! {:#?}", err);
+        error!(?err, "Failed sending alert to pagerduty!");
     }
 }
 
@@ -162,10 +161,13 @@ pub fn pagerduty_alert<T: Serialize>(
     let group = chain_id.map(|x| format!("chain #{}", x));
 
     let source = source.unwrap_or_else(|| {
-        gethostname().into_string().unwrap_or_else(|err| {
-            warn!("unable to handle hostname: {:#?}", err);
-            "unknown".to_string()
-        })
+        hostname::get()
+            .unwrap()
+            .into_string()
+            .unwrap_or_else(|err| {
+                warn!(?err, "unable to handle hostname");
+                "unknown".to_string()
+            })
     });
 
     let mut s = DefaultHasher::new();

@@ -1,10 +1,11 @@
 mod ws;
 
-use crate::block_number::{block_needed, BlockNeeded};
+use crate::block_number::CacheMode;
+use crate::caches::{RegisteredUserRateLimitKey, RpcSecretKeyCache, UserBalanceCache};
 use crate::config::{AppConfig, TopConfig};
 use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::frontend::authorization::{
-    Authorization, RequestMetadata, RequestOrMethod, ResponseOrBytes, RpcSecretKey,
+    Authorization, RequestMetadata, RequestOrMethod, ResponseOrBytes,
 };
 use crate::frontend::rpc_proxy_ws::ProxyMode;
 use crate::jsonrpc::{
@@ -13,23 +14,19 @@ use crate::jsonrpc::{
 };
 use crate::relational_db::{get_db, get_migrated_db, DatabaseConnection, DatabaseReplica};
 use crate::response_cache::{
-    json_rpc_response_weigher, JsonRpcQueryCacheKey, JsonRpcResponseCache, JsonRpcResponseEnum,
+    JsonRpcQueryCacheKey, JsonRpcResponseCache, JsonRpcResponseEnum, JsonRpcResponseWeigher,
 };
 use crate::rpcs::blockchain::Web3ProxyBlock;
-use crate::rpcs::consensus::ConsensusWeb3Rpcs;
+use crate::rpcs::consensus::RankedRpcs;
 use crate::rpcs::many::Web3Rpcs;
 use crate::rpcs::one::Web3Rpc;
 use crate::rpcs::provider::{connect_http, EthersHttpProvider};
 use crate::rpcs::transactions::TxStatus;
 use crate::stats::{AppStat, StatBuffer};
-use crate::user_token::UserBearerToken;
 use anyhow::Context;
-use axum::headers::{Origin, Referer, UserAgent};
 use axum::http::StatusCode;
 use chrono::Utc;
 use deferred_rate_limiter::DeferredRateLimiter;
-use derive_more::From;
-use entities::sea_orm_active_enums::TrackingLevel;
 use entities::user;
 use ethers::core::utils::keccak256;
 use ethers::prelude::{Address, Bytes, Transaction, TxHash, H256, U64};
@@ -38,12 +35,9 @@ use ethers::utils::rlp::{Decodable, Rlp};
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
 use hashbrown::{HashMap, HashSet};
-use ipnet::IpNet;
-use log::{error, info, trace, warn, Level};
-use migration::sea_orm::prelude::Decimal;
-use migration::sea_orm::{EntityTrait, PaginatorTrait};
+use migration::sea_orm::{DatabaseTransaction, EntityTrait, PaginatorTrait, TransactionTrait};
 use moka::future::{Cache, CacheBuilder};
-use parking_lot::Mutex;
+use once_cell::sync::OnceCell;
 use redis_rate_limiter::redis::AsyncCommands;
 use redis_rate_limiter::{redis, DeadpoolRuntime, RedisConfig, RedisPool, RedisRateLimiter};
 use serde::Serialize;
@@ -53,11 +47,13 @@ use std::fmt;
 use std::net::IpAddr;
 use std::num::NonZeroU64;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{atomic, Arc};
 use std::time::Duration;
-use tokio::sync::{broadcast, watch, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, watch, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::{error, info, trace, warn, Level};
 
 // TODO: make this customizable?
 // TODO: include GIT_REF in here. i had trouble getting https://docs.rs/vergen/latest/vergen/ to work with a workspace. also .git is in .dockerignore
@@ -68,50 +64,11 @@ pub static APP_USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION")
 );
 
-// aggregate across 1 week
+/// aggregate across 1 week
 pub const BILLING_PERIOD_SECONDS: i64 = 60 * 60 * 24 * 7;
 
+/// Convenience type
 pub type Web3ProxyJoinHandle<T> = JoinHandle<Web3ProxyResult<T>>;
-
-/// TODO: move this
-#[derive(Clone, Debug, Default, From)]
-pub struct AuthorizationChecks {
-    /// database id of the primary user. 0 if anon
-    /// TODO: do we need this? its on the authorization so probably not
-    /// TODO: `Option<NonZeroU64>`? they are actual zeroes some places in the db now
-    pub user_id: u64,
-    /// the key used (if any)
-    pub rpc_secret_key: Option<RpcSecretKey>,
-    /// database id of the rpc key
-    /// if this is None, then this request is being rate limited by ip
-    pub rpc_secret_key_id: Option<NonZeroU64>,
-    /// if None, allow unlimited queries. inherited from the user_tier
-    pub max_requests_per_period: Option<u64>,
-    // if None, allow unlimited concurrent requests. inherited from the user_tier
-    pub max_concurrent_requests: Option<u32>,
-    /// if None, allow any Origin
-    pub allowed_origins: Option<Vec<Origin>>,
-    /// if None, allow any Referer
-    pub allowed_referers: Option<Vec<Referer>>,
-    /// if None, allow any UserAgent
-    pub allowed_user_agents: Option<Vec<UserAgent>>,
-    /// if None, allow any IP Address
-    pub allowed_ips: Option<Vec<IpNet>>,
-    /// how detailed any rpc account entries should be
-    pub tracking_level: TrackingLevel,
-    /// Chance to save reverting eth_call, eth_estimateGas, and eth_sendRawTransaction to the database.
-    /// depending on the caller, errors might be expected. this keeps us from bloating our database
-    /// u16::MAX == 100%
-    pub log_revert_chance: u16,
-    /// if true, transactions are broadcast only to private mempools.
-    /// IMPORTANT! Once confirmed by a miner, they will be public on the blockchain!
-    pub private_txs: bool,
-    pub proxy_mode: ProxyMode,
-}
-
-/// Cache data from the database about rpc keys
-pub type RpcSecretKeyCache = Cache<RpcSecretKey, AuthorizationChecks>;
-pub type UserBalanceCache = Cache<NonZeroU64, Arc<RwLock<Decimal>>>;
 
 /// The application
 // TODO: i'm sure this is more arcs than necessary, but spawning futures makes references hard
@@ -120,13 +77,10 @@ pub struct Web3ProxyApp {
     pub balanced_rpcs: Arc<Web3Rpcs>,
     /// Send 4337 Abstraction Bundler requests to one of these servers
     pub bundler_4337_rpcs: Option<Arc<Web3Rpcs>>,
-    pub http_client: Option<reqwest::Client>,
     /// application config
     /// TODO: this will need a large refactor to handle reloads while running. maybe use a watch::Receiver?
     pub config: AppConfig,
-    /// Send private requests (like eth_sendRawTransaction) to all these servers
-    /// TODO: include another type so that we can use private miner relays that do not use JSONRPC requests
-    pub private_rpcs: Option<Arc<Web3Rpcs>>,
+    pub http_client: Option<reqwest::Client>,
     /// track JSONRPC responses
     pub jsonrpc_response_cache: JsonRpcResponseCache,
     /// rpc clients that subscribe to newHeads use this channel
@@ -141,36 +95,42 @@ pub struct Web3ProxyApp {
     /// Optional read-only database for users and accounting
     pub db_replica: Option<DatabaseReplica>,
     pub hostname: Option<String>,
-    pub internal_provider: Arc<EthersHttpProvider>,
-    /// store pending transactions that we've seen so that we don't send duplicates to subscribers
-    /// TODO: think about this more. might be worth storing if we sent the transaction or not and using this for automatic retries
-    pub pending_transactions: Cache<TxHash, TxStatus>,
+    pub frontend_port: Arc<AtomicU16>,
     /// rate limit anonymous users
     pub frontend_ip_rate_limiter: Option<DeferredRateLimiter<IpAddr>>,
     /// rate limit authenticated users
-    pub frontend_registered_user_rate_limiter: Option<DeferredRateLimiter<u64>>,
-    /// Optional time series database for making pretty graphs that load quickly
-    pub influxdb_client: Option<influxdb2::Client>,
+    pub frontend_registered_user_rate_limiter: Option<DeferredRateLimiter<RegisteredUserRateLimitKey>>,
+    /// concurrent/parallel request limits for anonymous users
+    pub ip_semaphores: Cache<IpAddr, Arc<Semaphore>>,
+    pub kafka_producer: Option<rdkafka::producer::FutureProducer>,
     /// rate limit the login endpoint
     /// we do this because each pending login is a row in the database
     pub login_rate_limiter: Option<RedisRateLimiter>,
-    /// volatile cache used for rate limits
-    /// TODO: i think i might just delete this entirely. instead use local-only concurrency limits.
-    pub vredis_pool: Option<RedisPool>,
+    /// store pending transactions that we've seen so that we don't send duplicates to subscribers
+    /// TODO: think about this more. might be worth storing if we sent the transaction or not and using this for automatic retries
+    pub pending_transactions: Cache<TxHash, TxStatus>,
+    /// Send private requests (like eth_sendRawTransaction) to all these servers
+    /// TODO: include another type so that we can use private miner relays that do not use JSONRPC requests
+    pub private_rpcs: Option<Arc<Web3Rpcs>>,
+    pub prometheus_port: Arc<AtomicU16>,
     /// cache authenticated users so that we don't have to query the database on the hot path
     // TODO: should the key be our RpcSecretKey class instead of Ulid?
     pub rpc_secret_key_cache: RpcSecretKeyCache,
     /// cache user balances so we don't have to check downgrade logic every single time
     pub user_balance_cache: UserBalanceCache,
     /// concurrent/parallel RPC request limits for authenticated users
-    pub user_semaphores: Cache<NonZeroU64, Arc<Semaphore>>,
-    /// concurrent/parallel request limits for anonymous users
-    pub ip_semaphores: Cache<IpAddr, Arc<Semaphore>>,
-    /// concurrent/parallel application request limits for authenticated users
-    pub bearer_token_semaphores: Cache<UserBearerToken, Arc<Semaphore>>,
-    pub kafka_producer: Option<rdkafka::producer::FutureProducer>,
+    pub user_semaphores: Cache<(NonZeroU64, IpAddr), Arc<Semaphore>>,
+    /// volatile cache used for rate limits
+    /// TODO: i think i might just delete this entirely. instead use local-only concurrency limits.
+    pub vredis_pool: Option<RedisPool>,
     /// channel for sending stats in a background task
-    pub stat_sender: Option<flume::Sender<AppStat>>,
+    pub stat_sender: Option<mpsc::UnboundedSender<AppStat>>,
+
+    /// Optional time series database for making pretty graphs that load quickly
+    influxdb_client: Option<influxdb2::Client>,
+    /// Simple way to connect ethers Contracsts to the proxy
+    /// TODO: make this more efficient
+    internal_provider: OnceCell<Arc<EthersHttpProvider>>,
 }
 
 /// flatten a JoinError into an anyhow error
@@ -194,12 +154,10 @@ pub async fn flatten_handles<T>(
             Ok(Ok(_)) => continue,
         }
     }
-
     Ok(())
 }
 
 /// starting an app creates many tasks
-#[derive(From)]
 pub struct Web3ProxyAppSpawn {
     /// the app. probably clone this to use in other groups of handles
     pub app: Arc<Web3ProxyApp>,
@@ -208,18 +166,21 @@ pub struct Web3ProxyAppSpawn {
     /// these are important and must be allowed to finish
     pub background_handles: FuturesUnordered<Web3ProxyJoinHandle<()>>,
     /// config changes are sent here
-    pub new_top_config_sender: watch::Sender<TopConfig>,
-    /// watch this to know when to start the app
-    pub consensus_connections_watcher: watch::Receiver<Option<Arc<ConsensusWeb3Rpcs>>>,
+    pub new_top_config: watch::Sender<TopConfig>,
+    /// watch this to know when the app is ready to serve requests
+    pub ranked_rpcs: watch::Receiver<Option<Arc<RankedRpcs>>>,
 }
 
 impl Web3ProxyApp {
     /// The main entrypoint.
     pub async fn spawn(
-        app_frontend_port: u16,
+        frontend_port: Arc<AtomicU16>,
+        prometheus_port: Arc<AtomicU16>,
         top_config: TopConfig,
         num_workers: usize,
         shutdown_sender: broadcast::Sender<()>,
+        flush_stat_buffer_sender: mpsc::Sender<oneshot::Sender<(usize, usize)>>,
+        flush_stat_buffer_receiver: mpsc::Receiver<oneshot::Sender<(usize, usize)>>,
     ) -> anyhow::Result<Web3ProxyAppSpawn> {
         let stat_buffer_shutdown_receiver = shutdown_sender.subscribe();
         let mut background_shutdown_receiver = shutdown_sender.subscribe();
@@ -236,15 +197,15 @@ impl Web3ProxyApp {
 
         if !top_config.extra.is_empty() {
             warn!(
-                "unknown TopConfig fields!: {:?}",
-                top_config.app.extra.keys()
+                extra=?top_config.extra.keys(),
+                "unknown TopConfig fields!",
             );
         }
 
         if !top_config.app.extra.is_empty() {
             warn!(
-                "unknown Web3ProxyAppConfig fields!: {:?}",
-                top_config.app.extra.keys()
+                extra=?top_config.app.extra.keys(),
+                "unknown Web3ProxyAppConfig fields!",
             );
         }
 
@@ -419,30 +380,28 @@ impl Web3ProxyApp {
         // create a channel for receiving stats
         // we do this in a channel so we don't slow down our response to the users
         // stats can be saved in mysql, influxdb, both, or none
-        let mut stat_sender = None;
-        if let Some(influxdb_bucket) = top_config.app.influxdb_bucket.clone() {
-            if let Some(spawned_stat_buffer) = StatBuffer::try_spawn(
-                BILLING_PERIOD_SECONDS,
-                influxdb_bucket,
-                top_config.app.chain_id,
-                db_conn.clone(),
-                60,
-                influxdb_client.clone(),
-                Some(rpc_secret_key_cache.clone()),
-                Some(user_balance_cache.clone()),
-                stat_buffer_shutdown_receiver,
-                1,
-            )? {
-                // since the database entries are used for accounting, we want to be sure everything is saved before exiting
-                important_background_handles.push(spawned_stat_buffer.background_handle);
+        let stat_sender = if let Some(spawned_stat_buffer) = StatBuffer::try_spawn(
+            BILLING_PERIOD_SECONDS,
+            top_config.app.chain_id,
+            db_conn.clone(),
+            60,
+            top_config.app.influxdb_bucket.clone(),
+            influxdb_client.clone(),
+            Some(rpc_secret_key_cache.clone()),
+            Some(user_balance_cache.clone()),
+            stat_buffer_shutdown_receiver,
+            1,
+            flush_stat_buffer_sender.clone(),
+            flush_stat_buffer_receiver,
+        )? {
+            // since the database entries are used for accounting, we want to be sure everything is saved before exiting
+            important_background_handles.push(spawned_stat_buffer.background_handle);
 
-                stat_sender = Some(spawned_stat_buffer.stat_sender);
-            }
-        }
-
-        if stat_sender.is_none() {
+            Some(spawned_stat_buffer.stat_sender)
+        } else {
             info!("stats will not be collected");
-        }
+            None
+        };
 
         // make a http shared client
         // TODO: can we configure the connection pool? should we?
@@ -476,10 +435,10 @@ impl Web3ProxyApp {
                 // these are deferred rate limiters because we don't want redis network requests on the hot path
                 // TODO: take cache_size from config
                 frontend_ip_rate_limiter = Some(
-                    DeferredRateLimiter::<IpAddr>::new(20_000, "ip", rpc_rrl.clone(), None).await,
+                    DeferredRateLimiter::new(20_000, "ip", rpc_rrl.clone(), None).await,
                 );
                 frontend_registered_user_rate_limiter =
-                    Some(DeferredRateLimiter::<u64>::new(10_000, "key", rpc_rrl, None).await);
+                    Some(DeferredRateLimiter::new(20_000, "key", rpc_rrl, None).await);
             }
 
             // login rate limiter
@@ -516,29 +475,31 @@ impl Web3ProxyApp {
         // responses can be very different in sizes, so this is a cache with a max capacity and a weigher
         // TODO: we should emit stats to calculate a more accurate expected cache size
         // TODO: do we actually want a TTL on this?
-        // TODO: configurable max item weight
-        // TODO: resize the cache automatically
+        // TODO: configurable max item weight insted of hard coding to .1% of the cache?
+        let jsonrpc_weigher =
+            JsonRpcResponseWeigher((top_config.app.response_cache_max_bytes / 1000) as u32);
+
         let jsonrpc_response_cache: JsonRpcResponseCache =
             CacheBuilder::new(top_config.app.response_cache_max_bytes)
                 .name("jsonrpc_response_cache")
                 .time_to_idle(Duration::from_secs(3600))
-                .weigher(json_rpc_response_weigher)
+                .weigher(move |k, v| jsonrpc_weigher.weigh(k, v))
                 .build();
 
         // TODO: how should we handle hitting this max?
         let max_users = 20_000;
 
         // create semaphores for concurrent connection limits
-        // TODO: how can we implement time til idle?
-        // TODO: what should tti be for semaphores?
-        let bearer_token_semaphores = Cache::new(max_users);
-        let ip_semaphores = Cache::new(max_users);
-        let user_semaphores = Cache::new(max_users);
+        // TODO: time-to-idle on these. need to make sure the arcs aren't anywhere though. so maybe arc isn't correct and it should be refs
+        let ip_semaphores = CacheBuilder::new(max_users).name("ip_semaphores").build();
+        let user_semaphores = CacheBuilder::new(max_users).name("user_semaphores").build();
+
+        let chain_id = top_config.app.chain_id;
 
         let (balanced_rpcs, balanced_handle, consensus_connections_watcher) = Web3Rpcs::spawn(
+            chain_id,
             db_conn.clone(),
-            top_config.app.max_block_age,
-            top_config.app.max_block_lag,
+            top_config.app.max_head_block_lag,
             top_config.app.min_synced_rpcs,
             top_config.app.min_sum_soft_limit,
             "balanced rpcs".to_string(),
@@ -547,7 +508,7 @@ impl Web3ProxyApp {
             Some(watch_consensus_head_sender),
         )
         .await
-        .context("spawning balanced rpcs")?;
+        .web3_context("spawning balanced rpcs")?;
 
         app_handles.push(balanced_handle);
 
@@ -561,9 +522,9 @@ impl Web3ProxyApp {
             // TODO: Merge
             // let (private_rpcs, private_rpcs_handle) = Web3Rpcs::spawn(
             let (private_rpcs, private_handle, _) = Web3Rpcs::spawn(
+                chain_id,
                 db_conn.clone(),
-                // private rpcs don't get subscriptions, so no need for max_block_age or max_block_lag
-                None,
+                // private rpcs don't get subscriptions, so no need for max_head_block_lag
                 None,
                 0,
                 0,
@@ -578,7 +539,7 @@ impl Web3ProxyApp {
                 None,
             )
             .await
-            .context("spawning private_rpcs")?;
+            .web3_context("spawning private_rpcs")?;
 
             app_handles.push(private_handle);
 
@@ -593,9 +554,9 @@ impl Web3ProxyApp {
         } else {
             // TODO: do something with the spawn handle
             let (bundler_4337_rpcs, bundler_4337_rpcs_handle, _) = Web3Rpcs::spawn(
+                chain_id,
                 db_conn.clone(),
-                // bundler_4337_rpcs don't get subscriptions, so no need for max_block_age or max_block_lag
-                None,
+                // bundler_4337_rpcs don't get subscriptions, so no need for max_head_block_lag
                 None,
                 0,
                 0,
@@ -605,7 +566,7 @@ impl Web3ProxyApp {
                 None,
             )
             .await
-            .context("spawning bundler_4337_rpcs")?;
+            .web3_context("spawning bundler_4337_rpcs")?;
 
             app_handles.push(bundler_4337_rpcs_handle);
 
@@ -616,36 +577,19 @@ impl Web3ProxyApp {
             .ok()
             .and_then(|x| x.to_str().map(|x| x.to_string()));
 
-        // TODO: i'm sure theres much better ways to do this, but i don't want to spend time fighting traits right now
-        // TODO: what interval? i don't think we use it
-        // i tried and failed to `impl JsonRpcClient for Web3ProxyApi`
-        // i tried and failed to set up ipc. http is already running, so lets just use that
-        let internal_provider = connect_http(
-            format!("http://127.0.0.1:{}", app_frontend_port)
-                .parse()
-                .unwrap(),
-            http_client.clone(),
-            Duration::from_secs(10),
-        )?;
-
-        let internal_provider = Arc::new(internal_provider);
-
         let app = Self {
             balanced_rpcs,
-            bearer_token_semaphores,
             bundler_4337_rpcs,
             config: top_config.app.clone(),
             db_conn,
             db_replica,
+            frontend_port: frontend_port.clone(),
             frontend_ip_rate_limiter,
             frontend_registered_user_rate_limiter,
             hostname,
-            vredis_pool,
-            rpc_secret_key_cache,
-            user_balance_cache,
             http_client,
             influxdb_client,
-            internal_provider,
+            internal_provider: Default::default(),
             ip_semaphores,
             jsonrpc_response_cache,
             kafka_producer,
@@ -653,8 +597,12 @@ impl Web3ProxyApp {
             pending_transactions,
             pending_tx_sender,
             private_rpcs,
+            prometheus_port: prometheus_port.clone(),
+            rpc_secret_key_cache,
             stat_sender,
+            user_balance_cache,
             user_semaphores,
+            vredis_pool,
             watch_consensus_head_receiver,
         };
 
@@ -678,9 +626,7 @@ impl Web3ProxyApp {
                     new_top_config_receiver
                         .changed()
                         .await
-                        .context("failed awaiting top_config change")?;
-
-                    info!("config changed");
+                        .web3_context("failed awaiting top_config change")?;
                 }
             });
 
@@ -688,7 +634,7 @@ impl Web3ProxyApp {
         }
 
         if important_background_handles.is_empty() {
-            info!("no important background handles");
+            trace!("no important background handles");
 
             let f = tokio::spawn(async move {
                 let _ = background_shutdown_receiver.recv().await;
@@ -699,31 +645,31 @@ impl Web3ProxyApp {
             important_background_handles.push(f);
         }
 
-        Ok((
+        Ok(Web3ProxyAppSpawn {
             app,
             app_handles,
-            important_background_handles,
-            new_top_config_sender,
-            consensus_connections_watcher,
-        )
-            .into())
+            background_handles: important_background_handles,
+            new_top_config: new_top_config_sender,
+            ranked_rpcs: consensus_connections_watcher,
+        })
     }
 
     pub async fn apply_top_config(&self, new_top_config: TopConfig) -> Web3ProxyResult<()> {
         // TODO: also update self.config from new_top_config.app
+        info!("applying new config");
 
         // connect to the backends
         self.balanced_rpcs
             .apply_server_configs(self, new_top_config.balanced_rpcs)
             .await
-            .context("updating balanced rpcs")?;
+            .web3_context("updating balanced rpcs")?;
 
         if let Some(private_rpc_configs) = new_top_config.private_rpcs {
             if let Some(ref private_rpcs) = self.private_rpcs {
                 private_rpcs
                     .apply_server_configs(self, private_rpc_configs)
                     .await
-                    .context("updating private_rpcs")?;
+                    .web3_context("updating private_rpcs")?;
             } else {
                 // TODO: maybe we should have private_rpcs just be empty instead of being None
                 todo!("handle toggling private_rpcs")
@@ -735,12 +681,14 @@ impl Web3ProxyApp {
                 bundler_4337_rpcs
                     .apply_server_configs(self, bundler_4337_rpc_configs)
                     .await
-                    .context("updating bundler_4337_rpcs")?;
+                    .web3_context("updating bundler_4337_rpcs")?;
             } else {
                 // TODO: maybe we should have bundler_4337_rpcs just be empty instead of being None
                 todo!("handle toggling bundler_4337_rpcs")
             }
         }
+
+        info!("config applied successfully");
 
         Ok(())
     }
@@ -749,11 +697,36 @@ impl Web3ProxyApp {
         self.watch_consensus_head_receiver.clone()
     }
 
+    pub fn influxdb_client(&self) -> Web3ProxyResult<&influxdb2::Client> {
+        self.influxdb_client.as_ref().ok_or(Web3ProxyError::NoDatabase)
+    }
+
     /// an ethers provider that you can use with ether's abigen.
     /// this works for now, but I don't like it
     /// TODO: I would much prefer we figure out the traits and `impl JsonRpcClient for Web3ProxyApp`
     pub fn internal_provider(&self) -> &Arc<EthersHttpProvider> {
-        &self.internal_provider
+        self.internal_provider.get_or_init(|| {
+            // TODO: i'm sure theres much better ways to do this, but i don't want to spend time fighting traits right now
+            // TODO: what interval? i don't think we use it
+            // i tried and failed to `impl JsonRpcClient for Web3ProxyApi`
+            // i tried and failed to set up ipc. http is already running, so lets just use that
+            let frontend_port = self.frontend_port.load(Ordering::Relaxed);
+
+            if frontend_port == 0 {
+                panic!("frontend is not running. cannot create provider yet");
+            }
+
+            let internal_provider = connect_http(
+                format!("http://127.0.0.1:{}", frontend_port)
+                    .parse()
+                    .unwrap(),
+                self.http_client.clone(),
+                Duration::from_secs(10),
+            )
+            .unwrap();
+
+            Arc::new(internal_provider)
+        })
     }
 
     pub async fn prometheus_metrics(&self) -> String {
@@ -765,11 +738,11 @@ impl Web3ProxyApp {
         #[derive(Default, Serialize)]
         struct UserCount(i64);
 
-        let user_count: UserCount = if let Some(db) = self.db_conn() {
-            match user::Entity::find().count(&db).await {
+        let user_count: UserCount = if let Ok(db) = self.db_conn() {
+            match user::Entity::find().count(db).await {
                 Ok(user_count) => UserCount(user_count as i64),
                 Err(err) => {
-                    warn!("unable to count users: {:?}", err);
+                    warn!(?err, "unable to count users");
                     UserCount(-1)
                 }
             }
@@ -801,7 +774,7 @@ impl Web3ProxyApp {
             RecentCounts,
             RecentCounts,
         ) = match self.redis_conn().await {
-            Ok(Some(mut redis_conn)) => {
+            Ok(mut redis_conn) => {
                 // TODO: delete any hash entries where
                 const ONE_MINUTE: i64 = 60;
                 const ONE_HOUR: i64 = ONE_MINUTE * 60;
@@ -882,7 +855,7 @@ impl Web3ProxyApp {
                         (recent_ip_counts, recent_user_id_counts, recent_tx_counts)
                     }
                     Err(err) => {
-                        warn!("unable to count recent users: {}", err);
+                        warn!(?err, "unable to count recent users");
                         (
                             RecentCounts::for_err(),
                             RecentCounts::for_err(),
@@ -891,13 +864,8 @@ impl Web3ProxyApp {
                     }
                 }
             }
-            Ok(None) => (
-                RecentCounts::default(),
-                RecentCounts::default(),
-                RecentCounts::default(),
-            ),
             Err(err) => {
-                warn!("unable to connect to redis while counting users: {:?}", err);
+                warn!(?err, "unable to connect to redis while counting users");
                 (
                     RecentCounts::for_err(),
                     RecentCounts::for_err(),
@@ -905,13 +873,6 @@ impl Web3ProxyApp {
                 )
             }
         };
-
-        // app.pending_transactions.sync();
-        // app.rpc_secret_key_cache.sync();
-        // "pending_transactions_count": app.pending_transactions.entry_count(),
-        // "pending_transactions_size": app.pending_transactions.weighted_size(),
-        // "user_cache_count": app.rpc_secret_key_cache.entry_count(),
-        // "user_cache_size": app.rpc_secret_key_cache.weighted_size(),
 
         #[derive(Serialize)]
         struct CombinedMetrics {
@@ -939,7 +900,7 @@ impl Web3ProxyApp {
         method: &str,
         params: P,
     ) -> Web3ProxyResult<R> {
-        let db_conn = self.db_conn();
+        let db_conn = self.db_conn().ok().cloned();
 
         let authorization = Arc::new(Authorization::internal(db_conn)?);
 
@@ -1023,17 +984,18 @@ impl Web3ProxyApp {
 
         // get the head block now so that any requests that need it all use the same block
         // TODO: this still has an edge condition if there is a reorg in the middle of the request!!!
-        let head_block_num = self
+        let head_block: Web3ProxyBlock = self
             .balanced_rpcs
-            .head_block_num()
-            .ok_or(Web3ProxyError::NoServersSynced)?;
+            .head_block()
+            .ok_or(Web3ProxyError::NoServersSynced)?
+            .clone();
 
         // TODO: use streams and buffers so we don't overwhelm our server
         let responses = join_all(
             requests
                 .into_iter()
                 .map(|request| {
-                    self.proxy_request(request, authorization.clone(), Some(head_block_num))
+                    self.proxy_request(request, authorization.clone(), Some(&head_block))
                 })
                 .collect::<Vec<_>>(),
         )
@@ -1062,23 +1024,34 @@ impl Web3ProxyApp {
         Ok((collected, collected_rpcs))
     }
 
-    /// TODO: i don't think we want or need this. just use app.db_conn, or maybe app.db_conn.clone() or app.db_conn.as_ref()
-    pub fn db_conn(&self) -> Option<DatabaseConnection> {
-        self.db_conn.clone()
+    #[inline]
+    pub fn db_conn(&self) -> Web3ProxyResult<&DatabaseConnection> {
+        self.db_conn.as_ref().ok_or(Web3ProxyError::NoDatabase)
     }
 
-    pub fn db_replica(&self) -> Option<DatabaseReplica> {
-        self.db_replica.clone()
+    #[inline]
+    pub async fn db_transaction(&self) -> Web3ProxyResult<DatabaseTransaction> {
+        if let Some(ref db_conn) = self.db_conn {
+            let x = db_conn.begin().await?;
+            Ok(x)
+        } else {
+            Err(Web3ProxyError::NoDatabase)
+        }
     }
 
-    pub async fn redis_conn(&self) -> anyhow::Result<Option<redis_rate_limiter::RedisConnection>> {
+    #[inline]
+    pub fn db_replica(&self) -> Web3ProxyResult<&DatabaseReplica> {
+        self.db_replica.as_ref().ok_or(Web3ProxyError::NoDatabase)
+    }
+
+    pub async fn redis_conn(&self) -> Web3ProxyResult<redis_rate_limiter::RedisConnection> {
         match self.vredis_pool.as_ref() {
-            // TODO: don't do an error. return None
-            None => Ok(None),
+            None => Err(Web3ProxyError::NoDatabase),
             Some(redis_pool) => {
-                let redis_conn = redis_pool.get().await?;
+                // TODO: add a From for this
+                let redis_conn = redis_pool.get().await.context("redis pool error")?;
 
-                Ok(Some(redis_conn))
+                Ok(redis_conn)
             }
         }
     }
@@ -1100,9 +1073,9 @@ impl Web3ProxyApp {
                         Some(request_metadata),
                         None,
                         None,
-                        Some(Level::Trace.into()),
+                        Some(Duration::from_secs(30)),
+                        Some(Level::TRACE.into()),
                         None,
-                        true,
                     )
                     .await;
 
@@ -1130,42 +1103,52 @@ impl Web3ProxyApp {
                 Some(request_metadata),
                 None,
                 None,
-                Some(Level::Trace.into()),
+                Some(Duration::from_secs(30)),
+                Some(Level::TRACE.into()),
                 num_public_rpcs,
-                true,
             )
             .await
     }
 
-    ///
-    // TODO: is this a good return type? i think the status code should be one level higher
+    /// proxy request with up to 3 tries.
     async fn proxy_request(
         self: &Arc<Self>,
-        request: JsonRpcRequest,
+        mut request: JsonRpcRequest,
         authorization: Arc<Authorization>,
-        head_block_num: Option<U64>,
+        head_block: Option<&Web3ProxyBlock>,
     ) -> (StatusCode, JsonRpcForwardedResponse, Vec<Arc<Web3Rpc>>) {
         let request_metadata = RequestMetadata::new(
             self,
             authorization,
             RequestOrMethod::Request(&request),
-            head_block_num.as_ref(),
+            head_block,
         )
         .await;
 
         let response_id = request.id;
 
+        // TODO: trace/kafka log request.params before we send them to _proxy_request_with_caching which might modify them
+
         let (code, response_data) = match self
             ._proxy_request_with_caching(
                 &request.method,
-                request.params,
-                head_block_num,
+                &mut request.params,
+                head_block,
+                Some(2),
                 &request_metadata,
             )
             .await
         {
-            Ok(response_data) => (StatusCode::OK, response_data),
-            Err(err) => err.as_response_parts(),
+            Ok(response_data) => {
+                request_metadata.error_response.store(false, Ordering::Release);
+
+                (StatusCode::OK, response_data)
+            },
+            Err(err) => {
+                request_metadata.error_response.store(true, Ordering::Release);
+
+                err.as_response_parts()
+            },
         };
 
         let response = JsonRpcForwardedResponse::from_response_data(response_data, response_id);
@@ -1183,8 +1166,9 @@ impl Web3ProxyApp {
     async fn _proxy_request_with_caching(
         self: &Arc<Self>,
         method: &str,
-        mut params: serde_json::Value,
-        head_block_num: Option<U64>,
+        params: &mut serde_json::Value,
+        head_block: Option<&Web3ProxyBlock>,
+        max_tries: Option<usize>,
         request_metadata: &Arc<RequestMetadata>,
     ) -> Web3ProxyResult<JsonRpcResponseEnum<Arc<RawValue>>> {
         // TODO: don't clone into a new string?
@@ -1298,8 +1282,10 @@ impl Web3ProxyApp {
                     let x = bundler_4337_rpcs
                         .try_proxy_connection::<_, Box<RawValue>>(
                             method,
-                            &params,
+                            params,
                             Some(request_metadata),
+                            max_tries,
+                            Some(Duration::from_secs(30)),
                             None,
                             None,
                         )
@@ -1315,11 +1301,9 @@ impl Web3ProxyApp {
             },
             "eth_accounts" => JsonRpcResponseEnum::from(serde_json::Value::Array(vec![])),
             "eth_blockNumber" => {
-                match head_block_num.or(self.balanced_rpcs.head_block_num()) {
-                    Some(head_block_num) => JsonRpcResponseEnum::from(json!(head_block_num)),
+                match head_block.cloned().or(self.balanced_rpcs.head_block()) {
+                    Some(head_block) => JsonRpcResponseEnum::from(json!(head_block.number())),
                     None => {
-                        // TODO: what does geth do if this happens?
-                        // TODO: standard not synced error
                         return Err(Web3ProxyError::NoServersSynced);
                     }
                 }
@@ -1338,8 +1322,10 @@ impl Web3ProxyApp {
                     .balanced_rpcs
                     .try_proxy_connection::<_, U256>(
                         method,
-                        &params,
+                        params,
                         Some(request_metadata),
+                        max_tries,
+                        Some(Duration::from_secs(30)),
                         None,
                         None,
                     )
@@ -1370,8 +1356,10 @@ impl Web3ProxyApp {
                     .balanced_rpcs
                     .try_proxy_connection::<_, Box<RawValue>>(
                         method,
-                        &params,
+                        params,
                         Some(request_metadata),
+                        max_tries,
+                        Some(Duration::from_secs(30)),
                         None,
                         None,
                     )
@@ -1393,8 +1381,11 @@ impl Web3ProxyApp {
                         .balanced_rpcs
                         .try_proxy_connection::<_, Box<RawValue>>(
                             method,
-                            &params,
+                            params,
                             Some(request_metadata),
+                            max_tries,
+                            Some(Duration::from_secs(30)),
+                            // TODO: should this be block 0 instead?
                             Some(&U64::one()),
                             None,
                         )
@@ -1418,7 +1409,7 @@ impl Web3ProxyApp {
                     self
                         .try_send_protected(
                             method,
-                            &params,
+                            params,
                             request_metadata,
                         )
                 )
@@ -1481,7 +1472,7 @@ impl Web3ProxyApp {
 
                         let f = async move {
                             match app.redis_conn().await {
-                                Ok(Some(mut redis_conn)) => {
+                                Ok(mut redis_conn) => {
                                     let hashed_tx_hash =
                                         Bytes::from(keccak256(salted_tx_hash.as_bytes()));
 
@@ -1492,11 +1483,11 @@ impl Web3ProxyApp {
                                         .zadd(recent_tx_hash_key, hashed_tx_hash.to_string(), now)
                                         .await?;
                                 }
-                                Ok(None) => {}
+                                Err(Web3ProxyError::NoDatabase) => {},
                                 Err(err) => {
                                     warn!(
-                                        "unable to save stats for eth_sendRawTransaction: {:?}",
-                                        err
+                                        ?err, 
+                                        "unable to save stats for eth_sendRawTransaction",
                                     )
                                 }
                             }
@@ -1594,42 +1585,40 @@ impl Web3ProxyApp {
             method => {
                 if method.starts_with("admin_") {
                     // TODO: emit a stat? will probably just be noise
-                    return Err(Web3ProxyError::AccessDenied);
+                    return Err(Web3ProxyError::AccessDenied("admin methods are not allowed".into()));
                 }
 
                 // TODO: if no servers synced, wait for them to be synced? probably better to error and let haproxy retry another server
-                let head_block_num = head_block_num
-                    .or(self.balanced_rpcs.head_block_num())
+                let head_block: Web3ProxyBlock = head_block
+                    .cloned()
+                    .or_else(|| self.balanced_rpcs.head_block())
                     .ok_or(Web3ProxyError::NoServersSynced)?;
 
                 // we do this check before checking caches because it might modify the request params
                 // TODO: add a stat for archive vs full since they should probably cost different
                 // TODO: this cache key can be rather large. is that okay?
-                let cache_key: Option<JsonRpcQueryCacheKey> = match block_needed(
+                let cache_key: Option<JsonRpcQueryCacheKey> = match CacheMode::new(
                     &authorization,
                     method,
-                    &mut params,
-                    head_block_num,
+                    params,
+                    &head_block,
                     &self.balanced_rpcs,
                 )
-                .await?
+                .await
                 {
-                    BlockNeeded::CacheSuccessForever => Some(JsonRpcQueryCacheKey::new(
+                    CacheMode::CacheSuccessForever => Some(JsonRpcQueryCacheKey::new(
                         None,
                         None,
                         method,
-                        &params,
+                        params,
                         false,
                     )),
-                    BlockNeeded::CacheNever => None,
-                    BlockNeeded::Cache {
-                        block_num,
+                    CacheMode::CacheNever => None,
+                    CacheMode::Cache {
+                        block,
                         cache_errors,
                     } => {
-                        let (request_block_hash, block_depth) = self
-                            .balanced_rpcs
-                            .block_hash(&authorization, &block_num)
-                            .await?;
+                        let block_depth = (head_block.number().saturating_sub(*block.num())).as_u64();
 
                         if block_depth < self.config.archive_depth {
                             request_metadata
@@ -1637,127 +1626,86 @@ impl Web3ProxyApp {
                                 .store(true, atomic::Ordering::Release);
                         }
 
-                        let request_block = self
-                            .balanced_rpcs
-                            .block(&authorization, &request_block_hash, None)
-                            .await?
-                            .block;
-
                         Some(JsonRpcQueryCacheKey::new(
-                            Some(request_block),
+                            Some(block),
                             None,
                             method,
-                            &params,
+                            params,
                             cache_errors,
                         ))
                     }
-                    BlockNeeded::CacheRange {
-                        from_block_num,
-                        to_block_num,
+                    CacheMode::CacheRange {
+                        from_block,
+                        to_block,
                         cache_errors,
                     } => {
-                        let (from_block_hash, block_depth) = self
-                            .balanced_rpcs
-                            .block_hash(&authorization, &from_block_num)
-                            .await?;
+                        let block_depth = (head_block.number().saturating_sub(*from_block.num())).as_u64();
 
                         if block_depth < self.config.archive_depth {
                             request_metadata
                                 .archive_request
                                 .store(true, atomic::Ordering::Release);
                         }
-
-                        let from_block = self
-                            .balanced_rpcs
-                            .block(&authorization, &from_block_hash, None)
-                            .await?
-                            .block;
-
-                        let (to_block_hash, _) = self
-                            .balanced_rpcs
-                            .block_hash(&authorization, &to_block_num)
-                            .await?;
-
-                        let to_block = self
-                            .balanced_rpcs
-                            .block(&authorization, &to_block_hash, None)
-                            .await?
-                            .block;
 
                         Some(JsonRpcQueryCacheKey::new(
                             Some(from_block),
                             Some(to_block),
                             method,
-                            &params,
+                            params,
                             cache_errors,
                         ))
                     }
                 };
 
                 // TODO: different timeouts for different user tiers. get the duration out of the request_metadata
-                let duration = Duration::from_secs(240);
+                let backend_request_timetout = Duration::from_secs(240);
 
                 if let Some(cache_key) = cache_key {
-                    let from_block_num = cache_key.from_block_num();
-                    let to_block_num = cache_key.to_block_num();
-                    let cache_errors = cache_key.cache_errors();
+                    let from_block_num = cache_key.from_block_num().copied();
+                    let to_block_num = cache_key.to_block_num().copied();
+                    let cache_jsonrpc_errors = cache_key.cache_errors();
 
-                    // moka makes us do annoying things with arcs
-                    enum CacheError {
-                        NotCached(JsonRpcResponseEnum<Arc<RawValue>>),
-                        Error(Arc<Web3ProxyError>),
-                    }
+                    // TODO: try to fetch out of s3
 
-                    let x = self
+                    self
                         .jsonrpc_response_cache
-                        .try_get_with::<_, Mutex<CacheError>>(cache_key.hash(), async {
+                        .try_get_with::<_, Web3ProxyError>(cache_key.hash(), async {
                             let response_data = timeout(
-                                duration,
+                                backend_request_timetout + Duration::from_millis(100),
                                 self.balanced_rpcs
                                     .try_proxy_connection::<_, Arc<RawValue>>(
                                         method,
-                                        &params,
+                                        params,
                                         Some(request_metadata),
+                                        max_tries,
+                                        Some(backend_request_timetout),
                                         from_block_num.as_ref(),
                                         to_block_num.as_ref(),
-                                    )
-                                )
-                                .await
-                                .map_err(|x| Mutex::new(CacheError::Error(Arc::new(Web3ProxyError::from(x)))))?;
+                                    ))
+                                .await?;
 
-                            // TODO: i think response data should be Arc<JsonRpcResponseEnum<Box<RawValue>>>, but that's more work
-                            let response_data: JsonRpcResponseEnum<Arc<RawValue>> = response_data.try_into()
-                                .map_err(|x| Mutex::new(CacheError::Error(Arc::new(x))))?;
-
-                            // TODO: read max size from the config
-                            if response_data.num_bytes() as u64 > self.config.response_cache_max_bytes / 1000 {
-                                Err(Mutex::new(CacheError::NotCached(response_data)))
-                            } else if matches!(response_data, JsonRpcResponseEnum::Result { .. }) || cache_errors {
-                                Ok(response_data)
+                            if !cache_jsonrpc_errors && let Err(err) = response_data {
+                                // if we are not supposed to cache jsonrpc errors,
+                                // then we must not convert Provider errors into a JsonRpcResponseEnum
+                                // return all the errors now. moka will not cache Err results
+                                Err(err)
                             } else {
-                                Err(Mutex::new(CacheError::NotCached(response_data)))
-                            }
-                        }).await;
+                                let response_data: JsonRpcResponseEnum<Arc<RawValue>> = response_data.try_into()?;
 
-                    match x {
-                        Ok(x) => x,
-                        Err(arc_err) => {
-                            let locked = arc_err.lock();
-
-                            match &*locked {
-                                CacheError::Error(err) => return Err(Web3ProxyError::Arc(err.clone())),
-                                CacheError::NotCached(x) => x.clone(),
+                                // TODO: response data should maybe be Arc<JsonRpcResponseEnum<Box<RawValue>>>, but that's more work
+                                Ok(response_data)
                             }
-                        }
-                    }
+                        }).await?
                 } else {
                     let x = timeout(
-                        duration,
+                        backend_request_timetout + Duration::from_millis(100),
                         self.balanced_rpcs
                         .try_proxy_connection::<_, Arc<RawValue>>(
                             method,
-                            &params,
+                            params,
                             Some(request_metadata),
+                            max_tries,
+                            Some(backend_request_timetout),
                             None,
                             None,
                         )

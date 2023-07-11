@@ -41,6 +41,18 @@ Start the server with the defaults (listen on `http://localhost:8544` and use `.
 cargo run --release -- proxyd
 ```
 
+Quickly run tests:
+
+```
+RUST_LOG=web3_proxy=trace,info cargo nextest run
+```
+
+Run more tests:
+
+```
+RUST_LOG=web3_proxy=trace,info cargo nextest run --features tests-needing-docker
+```
+
 ## Common commands
 
 Create a user:
@@ -53,6 +65,9 @@ Check that the proxy is working:
 
 ```
 curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"web3_clientVersion","id":1}' 127.0.0.1:8544
+```
+```
+curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_getBlockByNumber", "params": ["latest", false],"id":1}' 127.0.0.1:8544
 ```
 ```
 curl -X POST -H "Content-Type: application/json" --data '{"jsonrpc":"2.0","method":"eth_getBalance", "params": ["0x0000000000000000000000000000000000000000", "latest"],"id":1}' 127.0.0.1:8544
@@ -122,7 +137,12 @@ cargo install sea-orm-cli
 1. (optional) drop the current dev db
 2. `sea-orm-cli migrate`
 3. `sea-orm-cli generate entity -u mysql://root:dev_web3_proxy@127.0.0.1:13306/dev_web3_proxy -o entities/src --with-serde both`
-4. After running the above, you will need to manually fix some columns: `Vec<u8>` -> `sea_orm::prelude::Uuid` and `i8` -> `bool`. Related: <https://github.com/SeaQL/sea-query/issues/375> <https://github.com/SeaQL/sea-orm/issues/924>
+    - Be careful when adding the `--tables THE,MODIFIED,TABLES` flag. It will delete relationships if they aren't listed
+4. After running the above, you will need to manually fix some things
+    - Add any derives that got removed (like `Default`)
+    - `Vec<u8>` -> `sea_orm::prelude::Uuid` (Related: <https://github.com/SeaQL/sea-query/issues/375>)
+    - `i8` -> `bool` (Related: <https://github.com/SeaQL/sea-orm/issues/924>)
+    - add all the tables back into `mod.rs`
 
 ## Flame Graphs
 

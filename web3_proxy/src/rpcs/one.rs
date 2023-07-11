@@ -4,7 +4,7 @@ use super::provider::{connect_http, connect_ws, EthersHttpProvider, EthersWsProv
 use super::request::{OpenRequestHandle, OpenRequestResult};
 use crate::app::{flatten_handle, Web3ProxyJoinHandle};
 use crate::config::{BlockAndRpc, Web3RpcConfig};
-use crate::errors::{Web3ProxyError, Web3ProxyResult};
+use crate::errors::{Web3ProxyError, Web3ProxyErrorContext, Web3ProxyResult};
 use crate::frontend::authorization::Authorization;
 use crate::jsonrpc::{JsonRpcParams, JsonRpcResultData};
 use crate::rpcs::request::RequestErrorHandler;
@@ -14,12 +14,9 @@ use ethers::prelude::{Bytes, Middleware, TxHash, U64};
 use ethers::types::{Address, Transaction, U256};
 use futures::future::try_join_all;
 use futures::StreamExt;
-use latency::{EwmaLatency, PeakEwmaLatency};
-use log::{debug, info, trace, warn, Level};
+use latency::{EwmaLatency, PeakEwmaLatency, RollingQuantileLatency};
 use migration::sea_orm::DatabaseConnection;
 use nanorand::Rng;
-use ordered_float::OrderedFloat;
-use parking_lot::RwLock;
 use redis_rate_limiter::{RedisPool, RedisRateLimitResult, RedisRateLimiter};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
@@ -29,9 +26,9 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{self, AtomicU32, AtomicU64, AtomicUsize};
 use std::{cmp::Ordering, sync::Arc};
-use tokio::select;
-use tokio::sync::watch;
-use tokio::time::{interval, sleep, sleep_until, timeout, Duration, Instant, MissedTickBehavior};
+use tokio::sync::{mpsc, watch, RwLock as AsyncRwLock};
+use tokio::time::{interval, sleep, sleep_until, Duration, Instant, MissedTickBehavior};
+use tracing::{debug, error, info, trace, warn, Level};
 use url::Url;
 
 /// An active connection to a Web3 RPC server like geth or erigon.
@@ -63,17 +60,22 @@ pub struct Web3Rpc {
     pub(super) block_data_limit: AtomicU64,
     /// head_block is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) head_block: Option<watch::Sender<Option<Web3ProxyBlock>>>,
-    /// Track head block latency
-    pub(super) head_latency: RwLock<EwmaLatency>,
+    /// Track head block latency.
+    pub(super) head_delay: AsyncRwLock<EwmaLatency>,
     /// Track peak request latency
     /// peak_latency is only inside an Option so that the "Default" derive works. it will always be set.
     pub(super) peak_latency: Option<PeakEwmaLatency>,
     /// Automatically set priority
     pub(super) tier: AtomicU32,
-    /// Track total requests served
+    /// Track total internal requests served
     pub(super) internal_requests: AtomicUsize,
-    /// Track total requests served
+    /// Track total external requests served
     pub(super) external_requests: AtomicUsize,
+    /// If the head block is too old, it is ignored.
+    pub(super) max_head_block_age: Duration,
+    /// Track time used by external requests served
+    /// request_ms_histogram is only inside an Option so that the "Default" derive works. it will always be set.
+    pub(super) median_latency: Option<RollingQuantileLatency>,
     /// Track in-flight requests
     pub(super) active_requests: AtomicUsize,
     /// disconnect_watch is only inside an Option so that the "Default" derive works. it will always be set.
@@ -87,7 +89,7 @@ impl Web3Rpc {
     // TODO: have this take a builder (which will have channels attached). or maybe just take the config and give the config public fields
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
-        mut config: Web3RpcConfig,
+        config: Web3RpcConfig,
         name: String,
         chain_id: u64,
         db_conn: Option<DatabaseConnection>,
@@ -96,8 +98,9 @@ impl Web3Rpc {
         redis_pool: Option<RedisPool>,
         block_interval: Duration,
         block_map: BlocksByHashCache,
-        block_sender: Option<flume::Sender<BlockAndRpc>>,
-        tx_id_sender: Option<flume::Sender<(TxHash, Arc<Self>)>>,
+        block_and_rpc_sender: Option<mpsc::UnboundedSender<BlockAndRpc>>,
+        max_head_block_age: Duration,
+        tx_id_sender: Option<mpsc::UnboundedSender<(TxHash, Arc<Self>)>>,
     ) -> anyhow::Result<(Arc<Web3Rpc>, Web3ProxyJoinHandle<()>)> {
         let created_at = Instant::now();
 
@@ -132,27 +135,17 @@ impl Web3Rpc {
         let backup = config.backup;
 
         let block_data_limit: AtomicU64 = config.block_data_limit.unwrap_or_default().into();
-        let automatic_block_limit =
-            (block_data_limit.load(atomic::Ordering::Acquire) == 0) && block_sender.is_some();
+        let automatic_block_limit = (block_data_limit.load(atomic::Ordering::Acquire) == 0)
+            && block_and_rpc_sender.is_some();
 
         // have a sender for tracking hard limit anywhere. we use this in case we
         // and track on servers that have a configured hard limit
         let (hard_limit_until, _) = watch::channel(Instant::now());
 
         if config.ws_url.is_none() && config.http_url.is_none() {
-            if let Some(url) = config.url {
-                if url.starts_with("ws") {
-                    config.ws_url = Some(url);
-                } else if url.starts_with("http") {
-                    config.http_url = Some(url);
-                } else {
-                    return Err(anyhow!("only ws or http urls are supported"));
-                }
-            } else {
-                return Err(anyhow!(
-                    "either ws_url or http_url are required. it is best to set both"
-                ));
-            }
+            return Err(anyhow!(
+                "either ws_url or http_url are required. it is best to set both. they must both point to the same server!"
+            ));
         }
 
         let (head_block, _) = watch::channel(None);
@@ -168,6 +161,8 @@ impl Web3Rpc {
             // Start latency at 1 second
             Duration::from_secs(1),
         );
+
+        let median_request_latency = RollingQuantileLatency::spawn_median(1_000).await;
 
         let http_provider = if let Some(http_url) = config.http_url {
             let http_url = http_url.parse::<Url>()?;
@@ -201,8 +196,10 @@ impl Web3Rpc {
             hard_limit_until: Some(hard_limit_until),
             head_block: Some(head_block),
             http_provider,
+            max_head_block_age,
             name,
             peak_latency: Some(peak_latency),
+            median_latency: Some(median_request_latency),
             soft_limit: config.soft_limit,
             ws_url,
             disconnect_watch: Some(disconnect_watch),
@@ -219,7 +216,12 @@ impl Web3Rpc {
             tokio::spawn(async move {
                 // TODO: this needs to be a subscribe_with_reconnect that does a retry with jitter and exponential backoff
                 new_connection
-                    .subscribe_with_reconnect(block_map, block_sender, chain_id, tx_id_sender)
+                    .subscribe_with_reconnect(
+                        block_map,
+                        block_and_rpc_sender,
+                        chain_id,
+                        tx_id_sender,
+                    )
                     .await
             })
         };
@@ -234,7 +236,8 @@ impl Web3Rpc {
     /// TODO: tests on this!
     /// TODO: should tier or block number take priority?
     /// TODO: should this return a struct that implements sorting traits?
-    fn sort_on(&self, max_block: Option<U64>) -> (bool, u32, Reverse<U64>) {
+    /// TODO: move this to consensus.rs
+    fn sort_on(&self, max_block: Option<U64>) -> (bool, Reverse<U64>, u32) {
         let mut head_block = self
             .head_block
             .as_ref()
@@ -249,29 +252,31 @@ impl Web3Rpc {
 
         let backup = self.backup;
 
-        (!backup, tier, Reverse(head_block))
+        (!backup, Reverse(head_block), tier)
     }
 
+    /// TODO: move this to consensus.rs
     pub fn sort_for_load_balancing_on(
         &self,
         max_block: Option<U64>,
-    ) -> ((bool, u32, Reverse<U64>), OrderedFloat<f64>) {
+    ) -> ((bool, Reverse<U64>, u32), Duration) {
         let sort_on = self.sort_on(max_block);
 
-        let weighted_peak_ewma_seconds = self.weighted_peak_ewma_seconds();
+        let weighted_peak_latency = self.weighted_peak_latency();
 
-        let x = (sort_on, weighted_peak_ewma_seconds);
+        let x = (sort_on, weighted_peak_latency);
 
         trace!("sort_for_load_balancing {}: {:?}", self, x);
 
         x
     }
 
-    /// like sort_for_load_balancing, but shuffles tiers randomly instead of sorting by weighted_peak_ewma_seconds
+    /// like sort_for_load_balancing, but shuffles tiers randomly instead of sorting by weighted_peak_latency
+    /// TODO: move this to consensus.rs
     pub fn shuffle_for_load_balancing_on(
         &self,
         max_block: Option<U64>,
-    ) -> ((bool, u32, Reverse<U64>), u8) {
+    ) -> ((bool, Reverse<U64>, u32), u8) {
         let sort_on = self.sort_on(max_block);
 
         let mut rng = nanorand::tls_rng();
@@ -281,17 +286,17 @@ impl Web3Rpc {
         (sort_on, r)
     }
 
-    pub fn weighted_peak_ewma_seconds(&self) -> OrderedFloat<f64> {
+    pub fn weighted_peak_latency(&self) -> Duration {
         let peak_latency = if let Some(peak_latency) = self.peak_latency.as_ref() {
-            peak_latency.latency().as_secs_f64()
+            peak_latency.latency()
         } else {
-            1.0
+            Duration::from_secs(1)
         };
 
         // TODO: what ordering?
-        let active_requests = self.active_requests.load(atomic::Ordering::Acquire) as f64 + 1.0;
+        let active_requests = self.active_requests.load(atomic::Ordering::Acquire) as f32 + 1.0;
 
-        OrderedFloat(peak_latency * active_requests)
+        peak_latency.mul_f32(active_requests)
     }
 
     // TODO: would be great if rpcs exposed this. see https://github.com/ledgerwatch/erigon/issues/6391
@@ -308,17 +313,17 @@ impl Web3Rpc {
         // TODO: binary search between 90k and max?
         // TODO: start at 0 or 1?
         for block_data_limit in [0, 32, 64, 128, 256, 512, 1024, 90_000, u64::MAX] {
-            let head_block_num_future = self.internal_request::<_, U256>(
-                "eth_blockNumber",
-                &(),
-                // error here are expected, so keep the level low
-                Some(Level::Debug.into()),
-            );
-
-            let head_block_num = timeout(Duration::from_secs(5), head_block_num_future)
+            let head_block_num = self
+                .internal_request::<_, U256>(
+                    "eth_blockNumber",
+                    &[(); 0],
+                    // error here are expected, so keep the level low
+                    Some(Level::DEBUG.into()),
+                    Some(2),
+                    Some(Duration::from_secs(5)),
+                )
                 .await
-                .context("timeout fetching eth_blockNumber")?
-                .context("provider error")?;
+                .context("head_block_num error during check_block_data_limit")?;
 
             let maybe_archive_block = head_block_num.saturating_sub((block_data_limit).into());
 
@@ -338,7 +343,9 @@ impl Web3Rpc {
                         maybe_archive_block,
                     )),
                     // error here are expected, so keep the level low
-                    Some(Level::Trace.into()),
+                    Some(Level::TRACE.into()),
+                    Some(2),
+                    Some(Duration::from_secs(5)),
                 )
                 .await;
 
@@ -424,7 +431,13 @@ impl Web3Rpc {
         // TODO: what should the timeout be? should there be a request timeout?
         // trace!("waiting on chain id for {}", self);
         let found_chain_id: U64 = self
-            .internal_request("eth_chainId", &(), Some(Level::Trace.into()))
+            .internal_request(
+                "eth_chainId",
+                &[(); 0],
+                Some(Level::TRACE.into()),
+                Some(2),
+                Some(Duration::from_secs(5)),
+            )
             .await?;
 
         trace!("found_chain_id: {:#?}", found_chain_id);
@@ -439,6 +452,7 @@ impl Web3Rpc {
             .into());
         }
 
+        // TODO: only do this for balanced_rpcs. this errors on 4337 rpcs
         self.check_block_data_limit()
             .await
             .context(format!("unable to check_block_data_limit of {}", self))?;
@@ -451,7 +465,7 @@ impl Web3Rpc {
     pub(crate) async fn send_head_block_result(
         self: &Arc<Self>,
         new_head_block: Web3ProxyResult<Option<ArcBlock>>,
-        block_and_rpc_sender: &flume::Sender<BlockAndRpc>,
+        block_and_rpc_sender: &mpsc::UnboundedSender<BlockAndRpc>,
         block_map: &BlocksByHashCache,
     ) -> Web3ProxyResult<()> {
         let head_block_sender = self.head_block.as_ref().unwrap();
@@ -503,7 +517,7 @@ impl Web3Rpc {
                 }
             }
             Err(err) => {
-                warn!("unable to get block from {}. err={:?}", self, err);
+                warn!(?err, "unable to get block from {}", self);
 
                 // send an empty block to take this server out of rotation
                 head_block_sender.send_replace(None);
@@ -516,8 +530,7 @@ impl Web3Rpc {
 
         // tell web3rpcs about this rpc having this block
         block_and_rpc_sender
-            .send_async((new_head_block, self.clone()))
-            .await
+            .send((new_head_block, self.clone()))
             .context("block_and_rpc_sender failed sending")?;
 
         Ok(())
@@ -534,9 +547,12 @@ impl Web3Rpc {
         let head_block = self.head_block.as_ref().unwrap().borrow().clone();
 
         if let Some(head_block) = head_block {
-            let head_block = head_block.block;
-
             // TODO: if head block is very old and not expected to be syncing, emit warning
+            if head_block.age() > self.max_head_block_age {
+                return Err(anyhow::anyhow!("head_block is too old!").into());
+            }
+
+            let head_block = head_block.block;
 
             let block_number = head_block.number.context("no block number")?;
 
@@ -546,6 +562,8 @@ impl Web3Rpc {
                         "eth_getTransactionByHash",
                         &(txid,),
                         error_handler,
+                        Some(2),
+                        Some(Duration::from_secs(5)),
                     )
                     .await?
                     .context("no transaction")?;
@@ -567,6 +585,8 @@ impl Web3Rpc {
                     "eth_getCode",
                     &(to, block_number),
                     error_handler,
+                    Some(2),
+                    Some(Duration::from_secs(5)),
                 )
                 .await?;
         } else {
@@ -580,16 +600,16 @@ impl Web3Rpc {
     async fn subscribe_with_reconnect(
         self: Arc<Self>,
         block_map: BlocksByHashCache,
-        block_sender: Option<flume::Sender<BlockAndRpc>>,
+        block_and_rpc_sender: Option<mpsc::UnboundedSender<BlockAndRpc>>,
         chain_id: u64,
-        tx_id_sender: Option<flume::Sender<(TxHash, Arc<Self>)>>,
+        tx_id_sender: Option<mpsc::UnboundedSender<(TxHash, Arc<Self>)>>,
     ) -> Web3ProxyResult<()> {
         loop {
             if let Err(err) = self
                 .clone()
                 .subscribe(
                     block_map.clone(),
-                    block_sender.clone(),
+                    block_and_rpc_sender.clone(),
                     chain_id,
                     tx_id_sender.clone(),
                 )
@@ -599,7 +619,7 @@ impl Web3Rpc {
                     break;
                 }
 
-                warn!("{} subscribe err: {:#?}", self, err)
+                warn!(?err, "subscribe err on {}", self);
             } else if self.should_disconnect() {
                 break;
             }
@@ -623,18 +643,23 @@ impl Web3Rpc {
     async fn subscribe(
         self: Arc<Self>,
         block_map: BlocksByHashCache,
-        block_sender: Option<flume::Sender<BlockAndRpc>>,
+        block_and_rpc_sender: Option<mpsc::UnboundedSender<BlockAndRpc>>,
         chain_id: u64,
-        tx_id_sender: Option<flume::Sender<(TxHash, Arc<Self>)>>,
+        tx_id_sender: Option<mpsc::UnboundedSender<(TxHash, Arc<Self>)>>,
     ) -> Web3ProxyResult<()> {
         let error_handler = if self.backup {
             Some(RequestErrorHandler::DebugLevel)
         } else {
-            Some(RequestErrorHandler::ErrorLevel)
+            // TODO: info level?
+            Some(RequestErrorHandler::InfoLevel)
         };
 
+        if self.should_disconnect() {
+            return Ok(());
+        }
+
         if let Some(url) = self.ws_url.clone() {
-            debug!("starting websocket provider on {}", self);
+            trace!("starting websocket provider on {}", self);
 
             let x = connect_ws(url, usize::MAX).await?;
 
@@ -643,29 +668,35 @@ impl Web3Rpc {
             self.ws_provider.store(Some(x));
         }
 
-        debug!("starting subscriptions on {}", self);
+        if self.should_disconnect() {
+            return Ok(());
+        }
 
-        self.check_provider(chain_id).await?;
+        trace!("starting subscriptions on {}", self);
+
+        self.check_provider(chain_id)
+            .await
+            .web3_context("failed check_provider")?;
 
         let mut futures = vec![];
 
         // TODO: use this channel instead of self.disconnect_watch
-        let (subscribe_stop_tx, mut subscribe_stop_rx) = watch::channel(false);
+        let (subscribe_stop_tx, subscribe_stop_rx) = watch::channel(false);
 
-        // subscribe to the disconnect watch. the app uses this when shutting down
+        // subscribe to the disconnect watch. the app uses this when shutting down or when configs change
         if let Some(disconnect_watch_tx) = self.disconnect_watch.as_ref() {
+            let rpc = self.clone();
             let mut disconnect_watch_rx = disconnect_watch_tx.subscribe();
 
             let f = async move {
-                // TODO: make sure it changed to "true"
-                select! {
-                    x = disconnect_watch_rx.changed() => {
-                        x?;
-                    },
-                    x = subscribe_stop_rx.changed() => {
-                        x?;
-                    },
+                loop {
+                    if *disconnect_watch_rx.borrow_and_update() {
+                        break;
+                    }
+
+                    disconnect_watch_rx.changed().await?;
                 }
+                info!("disconnect triggered on {}", rpc);
                 Ok(())
             };
 
@@ -678,10 +709,8 @@ impl Web3Rpc {
             let rpc = self.clone();
 
             // TODO: how often? different depending on the chain?
-            // TODO: reset this timeout when a new block is seen? we need to keep request_latency updated though
+            // TODO: reset this timeout when a new block is seen? we need to keep median_request_latency updated though
             let health_sleep_seconds = 5;
-
-            let subscribe_stop_rx = subscribe_stop_tx.subscribe();
 
             // health check loop
             let f = async move {
@@ -699,7 +728,12 @@ impl Web3Rpc {
                         // TODO: move this into a function and the chaining should be easier
                         if let Err(err) = rpc.healthcheck(error_handler).await {
                             // TODO: different level depending on the error handler
-                            warn!("health checking {} failed: {:?}", rpc, err);
+                            // TODO: if rate limit error, set "retry_at"
+                            if rpc.backup {
+                                warn!(?err, "health check on {} failed", rpc);
+                            } else {
+                                error!(?err, "health check on {} failed", rpc);
+                            }
                         }
                     }
 
@@ -718,18 +752,22 @@ impl Web3Rpc {
         }
 
         // subscribe to new heads
-        if let Some(block_sender) = block_sender.clone() {
+        if let Some(block_and_rpc_sender) = block_and_rpc_sender.clone() {
             let clone = self.clone();
             let subscribe_stop_rx = subscribe_stop_tx.subscribe();
 
             let f = async move {
                 let x = clone
-                    .subscribe_new_heads(block_sender.clone(), block_map.clone(), subscribe_stop_rx)
+                    .subscribe_new_heads(
+                        block_and_rpc_sender.clone(),
+                        block_map.clone(),
+                        subscribe_stop_rx,
+                    )
                     .await;
 
                 // error or success, we clear the block when subscribe_new_heads exits
                 clone
-                    .send_head_block_result(Ok(None), &block_sender, &block_map)
+                    .send_head_block_result(Ok(None), &block_and_rpc_sender, &block_map)
                     .await?;
 
                 x
@@ -754,7 +792,7 @@ impl Web3Rpc {
 
         // try_join on the futures
         if let Err(err) = try_join_all(futures).await {
-            warn!("subscription erred: {:?}", err);
+            warn!(?err, "subscription erred");
         }
 
         debug!("subscriptions on {} exited", self);
@@ -763,17 +801,20 @@ impl Web3Rpc {
 
         // TODO: wait for all of the futures to exit?
 
+        // TODO: tell ethers to disconnect?
+        self.ws_provider.store(None);
+
         Ok(())
     }
 
     /// Subscribe to new blocks.
     async fn subscribe_new_heads(
         self: &Arc<Self>,
-        block_sender: flume::Sender<BlockAndRpc>,
+        block_sender: mpsc::UnboundedSender<BlockAndRpc>,
         block_map: BlocksByHashCache,
         subscribe_stop_rx: watch::Receiver<bool>,
     ) -> Web3ProxyResult<()> {
-        debug!("subscribing to new heads on {}", self);
+        trace!("subscribing to new heads on {}", self);
 
         // TODO: different handler depending on backup or not
         let error_handler = None;
@@ -797,7 +838,9 @@ impl Web3Rpc {
                     "eth_getBlockByNumber",
                     &("latest", false),
                     &authorization,
-                    Some(Level::Warn.into()),
+                    Some(Level::WARN.into()),
+                    Some(2),
+                    Some(Duration::from_secs(5)),
                 )
                 .await;
 
@@ -806,6 +849,7 @@ impl Web3Rpc {
 
             while let Some(block) = blocks.next().await {
                 if *subscribe_stop_rx.borrow() {
+                    trace!("stopping ws block subscription on {}", self);
                     break;
                 }
 
@@ -815,13 +859,14 @@ impl Web3Rpc {
                     .await?;
             }
         } else if self.http_provider.is_some() {
-            // there is a "watch_blocks" function, but a lot of public nodes do not support the necessary rpc endpoints
+            // there is a "watch_blocks" function, but a lot of public nodes (including llamanodes) do not support the necessary rpc endpoints
             // TODO: is 1/2 the block time okay?
             let mut i = interval(self.block_interval / 2);
             i.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
             loop {
                 if *subscribe_stop_rx.borrow() {
+                    trace!("stopping http block subscription on {}", self);
                     break;
                 }
 
@@ -830,7 +875,9 @@ impl Web3Rpc {
                         "eth_getBlockByNumber",
                         &("latest", false),
                         &authorization,
-                        Some(Level::Warn.into()),
+                        Some(Level::WARN.into()),
+                        Some(2),
+                        Some(Duration::from_secs(5)),
                     )
                     .await;
 
@@ -848,6 +895,7 @@ impl Web3Rpc {
             .await?;
 
         if *subscribe_stop_rx.borrow() {
+            debug!("new heads subscription exited");
             Ok(())
         } else {
             Err(anyhow!("new_heads subscription exited. reconnect needed").into())
@@ -857,10 +905,17 @@ impl Web3Rpc {
     /// Turn on the firehose of pending transactions
     async fn subscribe_pending_transactions(
         self: Arc<Self>,
-        tx_id_sender: flume::Sender<(TxHash, Arc<Self>)>,
+        tx_id_sender: mpsc::UnboundedSender<(TxHash, Arc<Self>)>,
         mut subscribe_stop_rx: watch::Receiver<bool>,
     ) -> Web3ProxyResult<()> {
-        subscribe_stop_rx.changed().await?;
+        // TODO: check that it actually changed to true
+        loop {
+            if *subscribe_stop_rx.borrow_and_update() {
+                break;
+            }
+
+            subscribe_stop_rx.changed().await?;
+        }
 
         /*
         trace!("watching pending transactions on {}", self);
@@ -918,6 +973,8 @@ impl Web3Rpc {
         max_wait: Option<Duration>,
         error_handler: Option<RequestErrorHandler>,
     ) -> Web3ProxyResult<OpenRequestHandle> {
+        // TODO: what should the default be?
+        // TODO: split max_wait_connect (which might wait if a rate limit is pending) and max_wait_request
         let max_wait_until = max_wait.map(|x| Instant::now() + x);
 
         loop {
@@ -994,9 +1051,9 @@ impl Web3Rpc {
                     if !self.backup {
                         let when = retry_at.duration_since(Instant::now());
                         warn!(
-                            "Exhausted rate limit on {}. Retry in {}ms",
+                            retry_ms=%when.as_millis(),
+                            "Exhausted rate limit on {}",
                             self,
-                            when.as_millis()
                         );
                     }
 
@@ -1024,11 +1081,20 @@ impl Web3Rpc {
         method: &str,
         params: &P,
         error_handler: Option<RequestErrorHandler>,
+        max_tries: Option<usize>,
+        max_wait: Option<Duration>,
     ) -> Web3ProxyResult<R> {
         let authorization = Default::default();
 
-        self.authorized_request(method, params, &authorization, error_handler)
-            .await
+        self.authorized_request(
+            method,
+            params,
+            &authorization,
+            error_handler,
+            max_tries,
+            max_wait,
+        )
+        .await
     }
 
     pub async fn authorized_request<P: JsonRpcParams, R: JsonRpcResultData>(
@@ -1037,15 +1103,42 @@ impl Web3Rpc {
         params: &P,
         authorization: &Arc<Authorization>,
         error_handler: Option<RequestErrorHandler>,
+        max_tries: Option<usize>,
+        max_wait: Option<Duration>,
     ) -> Web3ProxyResult<R> {
         // TODO: take max_wait as a function argument?
-        let x = self
-            .wait_for_request_handle(authorization, None, error_handler)
-            .await?
-            .request::<P, R>(method, params)
-            .await?;
+        let mut tries = max_tries.unwrap_or(1);
 
-        Ok(x)
+        let mut last_error: Option<Web3ProxyError> = None;
+
+        while tries > 0 {
+            tries -= 1;
+
+            let handle = match self
+                .wait_for_request_handle(authorization, max_wait, error_handler)
+                .await
+            {
+                Ok(x) => x,
+                Err(err) => {
+                    last_error = Some(err);
+                    continue;
+                }
+            };
+
+            match handle.request::<P, R>(method, params).await {
+                Ok(x) => return Ok(x),
+                Err(err) => {
+                    last_error = Some(err.into());
+                    continue;
+                }
+            }
+        }
+
+        if let Some(last_error) = last_error {
+            return Err(last_error);
+        }
+
+        Err(anyhow::anyhow!("authorized_request failed in an unexpected way").into())
     }
 }
 
@@ -1093,7 +1186,7 @@ impl Serialize for Web3Rpc {
     where
         S: Serializer,
     {
-        // 3 is the number of fields in the struct.
+        // 14 if we bring head_delay back
         let mut state = serializer.serialize_struct("Web3Rpc", 13)?;
 
         // the url is excluded because it likely includes private information. just show the name that we use in keys
@@ -1139,16 +1232,30 @@ impl Serialize for Web3Rpc {
             &self.active_requests.load(atomic::Ordering::Relaxed),
         )?;
 
-        state.serialize_field("head_latency_ms", &self.head_latency.read().value())?;
-
-        state.serialize_field(
-            "peak_latency_ms",
-            &self.peak_latency.as_ref().unwrap().latency().as_millis(),
-        )?;
+        // {
+        //     let head_delay_ms = self.head_delay.read().await.latency().as_secs_f32() * 1000.0;
+        //     state.serialize_field("head_delay_ms", &(head_delay_ms))?;
+        // }
 
         {
-            let weighted_latency_ms = self.weighted_peak_ewma_seconds() * 1000.0;
-            state.serialize_field("weighted_latency_ms", weighted_latency_ms.as_ref())?;
+            let median_latency_ms = self
+                .median_latency
+                .as_ref()
+                .unwrap()
+                .latency()
+                .as_secs_f32()
+                * 1000.0;
+            state.serialize_field("median_latency_ms", &(median_latency_ms))?;
+        }
+
+        {
+            let peak_latency_ms =
+                self.peak_latency.as_ref().unwrap().latency().as_secs_f32() * 1000.0;
+            state.serialize_field("peak_latency_ms", &peak_latency_ms)?;
+        }
+        {
+            let weighted_latency_ms = self.weighted_peak_latency().as_secs_f32() * 1000.0;
+            state.serialize_field("weighted_latency_ms", &weighted_latency_ms)?;
         }
 
         state.end()
@@ -1174,7 +1281,6 @@ impl fmt::Debug for Web3Rpc {
 
 impl fmt::Display for Web3Rpc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // TODO: filter basic auth and api keys
         write!(f, "{}", &self.name)
     }
 }
@@ -1292,7 +1398,7 @@ mod tests {
             backup: false,
             block_data_limit: block_data_limit.into(),
             tier: 0,
-            head_block: RwLock::new(Some(head_block.clone())),
+            head_block: AsyncRwLock::new(Some(head_block.clone())),
         };
 
         assert!(!x.has_block_data(&0.into()));

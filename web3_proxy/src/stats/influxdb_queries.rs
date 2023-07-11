@@ -1,4 +1,5 @@
 use super::StatType;
+use crate::balance::Balance;
 use crate::errors::Web3ProxyErrorContext;
 use crate::{
     app::Web3ProxyApp,
@@ -15,14 +16,14 @@ use axum::{
     Json, TypedHeader,
 };
 use entities::sea_orm_active_enums::Role;
-use entities::{rpc_key, secondary_user};
+use entities::{rpc_key, secondary_user, user, user_tier};
 use fstrings::{f, format_args_f};
 use hashbrown::HashMap;
 use influxdb2::api::query::FluxRecord;
 use influxdb2::models::Query;
-use log::{debug, error, trace, warn};
 use migration::sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::json;
+use tracing::{debug, error, trace, warn};
 use ulid::Ulid;
 
 pub async fn query_user_stats<'a>(
@@ -31,30 +32,97 @@ pub async fn query_user_stats<'a>(
     params: &'a HashMap<String, String>,
     stat_response_type: StatType,
 ) -> Web3ProxyResponse {
-    let (user_id, _semaphore) = match bearer {
+    let caller_user = match bearer {
         Some(TypedHeader(Authorization(bearer))) => {
-            let (user, semaphore) = app.bearer_is_authorized(bearer).await?;
-            (user.id, Some(semaphore))
+            let user = app.bearer_is_authorized(bearer).await?;
+
+            Some(user)
         }
-        None => (0, None),
+        None => None,
     };
 
     // Return an error if the bearer is **not** set, but the StatType is Detailed
-    if stat_response_type == StatType::Detailed && user_id == 0 {
-        return Err(Web3ProxyError::BadRequest(
+    if stat_response_type == StatType::Detailed && caller_user.is_none() {
+        return Err(Web3ProxyError::AccessDenied(
             "Detailed Stats Response requires you to authorize with a bearer token".into(),
         ));
     }
 
-    let db_replica = app
-        .db_replica()
-        .context("query_user_stats needs a db replica")?;
+    let db_replica = app.db_replica()?;
 
-    // TODO: have a getter for this. do we need a connection pool on it?
-    let influxdb_client = app
-        .influxdb_client
-        .as_ref()
-        .context("query_user_stats needs an influxdb client")?;
+    // Read the (optional) user-id from the request, this is the logic for subusers
+    // If there is no bearer token, this is not allowed
+    let user_id: u64 = params
+        .get("user_id")
+        .and_then(|x| x.parse::<u64>().ok())
+        .unwrap_or_else(|| caller_user.as_ref().map(|x| x.id).unwrap_or_default());
+
+    // Only allow stats if the user has an active premium role
+    if let Some(caller_user) = &caller_user {
+        // get the balance of the user whose stats we are going to fetch (might be self, but might be another user)
+        let balance = match Balance::try_from_db(db_replica.as_ref(), user_id).await? {
+            None => {
+                return Err(Web3ProxyError::AccessDenied(
+                    "User Stats Response requires you to authorize with a bearer token".into(),
+                ));
+            }
+            Some(x) => x,
+        };
+
+        // get the user tier so we can see if it is a tier that has downgrades
+        let relevant_balance_user_tier_id = if user_id == caller_user.id {
+            // use the caller's tier
+            caller_user.user_tier_id
+        } else {
+            // use the tier of the primary user from a secondary user
+            let user = user::Entity::find_by_id(user_id)
+                .one(db_replica.as_ref())
+                .await?
+                .web3_context("user_id not found")?;
+
+            user.user_tier_id
+        };
+
+        let user_tier = user_tier::Entity::find_by_id(relevant_balance_user_tier_id)
+            .one(db_replica.as_ref())
+            .await?
+            .web3_context("user_tier not found")?;
+
+        if user_tier.downgrade_tier_id.is_some() && !balance.active_premium() {
+            trace!(%user_id, "User does not have enough balance to qualify for premium");
+            return Err(Web3ProxyError::PaymentRequired);
+        }
+
+        if user_id != caller_user.id {
+            // check that there is at least on rpc-keys owned by the requested user and related to the caller user
+            let user_rpc_key_ids: Vec<u64> = rpc_key::Entity::find()
+                .filter(rpc_key::Column::UserId.eq(user_id))
+                .all(db_replica.as_ref())
+                .await?
+                .into_iter()
+                .map(|x| x.id)
+                .collect::<Vec<_>>();
+
+            if secondary_user::Entity::find()
+                .filter(secondary_user::Column::UserId.eq(caller_user.id))
+                .filter(secondary_user::Column::RpcSecretKeyId.is_in(user_rpc_key_ids))
+                .filter(secondary_user::Column::Role.ne(Role::Collaborator))
+                .one(db_replica.as_ref())
+                .await?
+                .is_none()
+            {
+                return Err(Web3ProxyError::AccessDenied(
+                    "Not a subuser of the given user_id".into(),
+                ));
+            }
+        }
+    } else if user_id != 0 {
+        return Err(Web3ProxyError::AccessDenied(
+            "User Stats Response requires you to authorize with a bearer token".into(),
+        ));
+    }
+
+    let influxdb_client = app.influxdb_client()?;
 
     let query_window_seconds = get_query_window_seconds_from_params(params)?;
     let query_start = get_query_start_from_params(params)?.timestamp();
@@ -149,7 +217,7 @@ pub async fn query_user_stats<'a>(
         .config
         .influxdb_bucket
         .clone()
-        .context("No influxdb bucket was provided")?; // "web3_proxy";
+        .context("No influxdb bucket was provided")?;
 
     trace!("Bucket is {:?}", bucket);
     let mut filter_chain_id = "".to_string();
@@ -169,9 +237,29 @@ pub async fn query_user_stats<'a>(
     trace!("Filters are: {:?}", filter_chain_id); // filter_field
     trace!("window seconds are: {:?}", query_window_seconds);
 
-    let drop_method = match stat_response_type {
-        StatType::Aggregated => f!(r#"|> drop(columns: ["method"])"#),
-        StatType::Detailed => "".to_string(),
+    let group_keys = match stat_response_type {
+        StatType::Aggregated => {
+            r#"[
+            "_field",
+            "_measurement",
+            "archive_needed",
+            "chain_id",
+            "error_response",
+            "rpc_secret_key_id",
+        ]"#
+        }
+        StatType::Detailed => {
+            r#"[
+            "_field",
+            "_measurement",
+            "archive_needed",
+            "chain_id",
+            "error_response",
+            "method",
+            "rpc_secret_key_id",
+            "user_error_response",
+        ]"#
+        }
     };
 
     let join_candidates = f!(
@@ -184,39 +272,62 @@ pub async fn query_user_stats<'a>(
         ]
     );
 
-    let query = f!(r#"
-    base = () => from(bucket: "{bucket}")
-        |> range(start: {query_start}, stop: {query_stop})
-        {drop_method}
-        {rpc_key_filter}
-        {filter_chain_id}
-        |> filter(fn: (r) => r._measurement == "{measurement}")
+    let query;
+    if stat_response_type == StatType::Detailed
+        || (stat_response_type == StatType::Aggregated && user_id != 0)
+    {
+        query = f!(r#"
+            base = () => from(bucket: "{bucket}")
+                |> range(start: {query_start}, stop: {query_stop})
+                {rpc_key_filter}
+                {filter_chain_id}
+                |> filter(fn: (r) => r._measurement == "{measurement}")
+                
+            cumsum = base()
+                |> filter(fn: (r) => r._field == "backend_requests" or r._field == "cache_hits" or r._field == "cache_misses" or r._field == "frontend_requests" or r._field == "no_servers" or r._field == "sum_credits_used" or r._field == "sum_request_bytes" or r._field == "sum_response_bytes" or r._field == "sum_response_millis")
+                |> group(columns: {group_keys})
+                |> aggregateWindow(every: {query_window_seconds}s, fn: sum, createEmpty: false)
+                |> drop(columns: ["_start", "_stop"])
+                |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+                |> group()
+                
+            balance = base()
+                |> filter(fn: (r) => r["_field"] == "balance")
+                |> group(columns: ["_field", "_measurement", "chain_id"])
+                |> aggregateWindow(every: {query_window_seconds}s, fn: mean, createEmpty: false)
+                |> drop(columns: ["_start", "_stop"])
+                |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+                |> group()
         
-    cumsum = base()
-        |> filter(fn: (r) => r._field == "backend_requests" or r._field == "cache_hits" or r._field == "cache_misses" or r._field == "frontend_requests" or r._field == "no_servers" or r._field == "sum_credits_used" or r._field == "sum_request_bytes" or r._field == "sum_response_bytes" or r._field == "sum_response_millis")
-        |> group(columns: ["_field", "_measurement", "archive_needed", "chain_id", "error_response", "method", "rpc_secret_key_id"])
-        |> aggregateWindow(every: {query_window_seconds}s, fn: sum, createEmpty: false)
-        |> drop(columns: ["_start", "_stop"])
-        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-        |> group()
-        
-    balance = base()
-        |> filter(fn: (r) => r["_field"] == "balance")
-        |> group(columns: ["_field", "_measurement", "chain_id"])
-        |> aggregateWindow(every: {query_window_seconds}s, fn: mean, createEmpty: false)
-        |> drop(columns: ["_start", "_stop"])
-        |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-        |> group()
+            join(
+                tables: {{cumsum, balance}},
+                on: {join_candidates}
+            )
+        "#);
+    } else if stat_response_type == StatType::Aggregated && user_id == 0 {
+        query = f!(r#"
+            from(bucket: "{bucket}")
+                |> range(start: {query_start}, stop: {query_stop})
+                {filter_chain_id}
+                |> filter(fn: (r) => r._measurement == "{measurement}")
+                |> filter(fn: (r) => r._field != "balance")
+                |> group(columns: {group_keys})
+                |> aggregateWindow(every: {query_window_seconds}s, fn: sum, createEmpty: false)
+                |> drop(columns: ["_start", "_stop"])
+                |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+                |> group()
+        "#);
+    } else {
+        // In this something with our logic is wrong
+        return Err(Web3ProxyError::BadResponse(
+            "This edge-case should never occur".into(),
+        ));
+    }
 
-    join(
-        tables: {{cumsum, balance}},
-        on: {join_candidates}
-    )
-    "#);
-
-    debug!("Raw query to db is: {:#?}", query);
+    // TODO: lower log level
+    debug!("Raw query to db is: {:#}", query);
     let query = Query::new(query.to_string());
-    trace!("Query to db is: {:?}", query);
+    trace!(?query, "influx");
 
     // Make the query and collect all data
     let raw_influx_responses: Vec<FluxRecord> = influxdb_client
@@ -381,12 +492,14 @@ pub async fn query_user_stats<'a>(
                 } else if key == "rpc_secret_key_id" {
                     match value {
                         influxdb2_structmap::value::Value::String(inner) => {
-                            out.insert(
-                                "rpc_key",
-                                serde_json::Value::String(
-                                    rpc_key_id_to_key.get(&inner).unwrap().to_string(),
-                                ),
-                            );
+                            match rpc_key_id_to_key.get(&inner) {
+                                Some(x) => {
+                                    out.insert("rpc_key", serde_json::Value::String(x.to_string()));
+                                }
+                                None => {
+                                    trace!("rpc_secret_key_id is not included in this query")
+                                }
+                            }
                         }
                         _ => {
                             error!("rpc_secret_key_id should always be a String!");
@@ -457,7 +570,25 @@ pub async fn query_user_stats<'a>(
                             );
                         }
                         _ => {
-                            error!("error_response should always be a Long!");
+                            error!("error_response should always be a String!");
+                        }
+                    }
+                } else if stat_response_type == StatType::Detailed && key == "user_error_response" {
+                    match value {
+                        influxdb2_structmap::value::Value::String(inner) => {
+                            out.insert(
+                                "user_error_response",
+                                if inner == "true" {
+                                    serde_json::Value::Bool(true)
+                                } else if inner == "false" {
+                                    serde_json::Value::Bool(false)
+                                } else {
+                                    serde_json::Value::String("error".to_owned())
+                                },
+                            );
+                        }
+                        _ => {
+                            error!("user_error_response should always be a String!");
                         }
                     }
                 }

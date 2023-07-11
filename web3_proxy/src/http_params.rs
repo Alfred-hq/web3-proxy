@@ -9,9 +9,9 @@ use axum::{
 use chrono::{NaiveDateTime, Utc};
 use entities::login;
 use hashbrown::HashMap;
-use log::{debug, warn};
 use migration::sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use redis_rate_limiter::{redis::AsyncCommands, RedisConnection};
+use tracing::{trace, warn};
 
 /// get the attached address for the given bearer token.
 /// First checks redis. Then checks the database.
@@ -43,9 +43,8 @@ pub async fn get_user_id_from_params(
                     let user_login = login::Entity::find()
                         .filter(login::Column::BearerToken.eq(user_bearer_token.uuid()))
                         .one(db_replica.as_ref())
-                        .await
-                        .context("database error while querying for user")?
-                        .ok_or(Web3ProxyError::AccessDenied)?;
+                        .await?
+                        .ok_or(Web3ProxyError::AccessDenied("unknown bearer token".into()))?;
 
                     // if expired, delete ALL expired logins
                     let now = Utc::now();
@@ -58,9 +57,9 @@ pub async fn get_user_id_from_params(
                             .await?;
 
                         // TODO: emit a stat? if this is high something weird might be happening
-                        debug!("cleared expired logins: {:?}", delete_result);
+                        trace!("cleared expired logins: {:?}", delete_result);
 
-                        return Err(Web3ProxyError::AccessDenied);
+                        return Err(Web3ProxyError::AccessDenied("login expired".into()));
                     }
 
                     save_to_redis = true;
@@ -76,7 +75,9 @@ pub async fn get_user_id_from_params(
             let user_id: u64 = user_id.parse().context("Parsing user_id param")?;
 
             if bearer_user_id != user_id {
-                return Err(Web3ProxyError::AccessDenied);
+                return Err(Web3ProxyError::AccessDenied(
+                    "bearer_user_id and user_id mismatch".into(),
+                ));
             }
 
             if save_to_redis {
@@ -87,7 +88,7 @@ pub async fn get_user_id_from_params(
                     .set_ex::<_, _, ()>(user_redis_key, user_id, ONE_DAY)
                     .await
                 {
-                    warn!("Unable to save user bearer token to redis: {}", err)
+                    warn!(?err, "Unable to save user bearer token to redis")
                 }
             }
 
@@ -103,7 +104,9 @@ pub async fn get_user_id_from_params(
             // TODO: proper error code from a useful error code
             // TODO: maybe instead of this sharp edged warn, we have a config value?
             // TODO: check config for if we should deny or allow this
-            Err(Web3ProxyError::AccessDenied)
+            Err(Web3ProxyError::AccessDenied(
+                "bearer token required when requesting a specific id".into(),
+            ))
             // // TODO: make this a flag
             // warn!("allowing without auth during development!");
             // Ok(x.parse()?)

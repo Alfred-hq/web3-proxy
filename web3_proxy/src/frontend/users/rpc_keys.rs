@@ -10,7 +10,7 @@ use axum::{
 };
 use axum_macros::debug_handler;
 use entities;
-use entities::sea_orm_active_enums::{Role, TrackingLevel};
+use entities::sea_orm_active_enums::Role;
 use entities::{rpc_key, secondary_user};
 use hashbrown::HashMap;
 use http::HeaderValue;
@@ -19,7 +19,7 @@ use itertools::Itertools;
 use migration::sea_orm::{
     self, ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, TryIntoModel,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -29,17 +29,51 @@ pub async fn rpc_keys_get(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
 ) -> Web3ProxyResponse {
-    let (user, _semaphore) = app.bearer_is_authorized(bearer).await?;
+    let user = app.bearer_is_authorized(bearer).await?;
 
-    let db_replica = app
-        .db_replica()
-        .web3_context("db_replica is required to fetch a user's keys")?;
+    let db_replica = app.db_replica()?;
 
-    let uks = rpc_key::Entity::find()
+    // This is basically completely copied from sea-orm. Not optimal, but it keeps the format identical to before (while adding the final key)
+    // We could also pack the below stuff into it's subfield, but then we would destroy the format. Both options are fine for now though
+    #[derive(Serialize)]
+    struct ReturnType<'a> {
+        id: u64,
+        user_id: u64,
+        secret_key: RpcSecretKey,
+        description: Option<String>,
+        private_txs: bool,
+        active: bool,
+        allowed_ips: Option<String>,
+        allowed_origins: Option<String>,
+        allowed_referers: Option<String>,
+        allowed_user_agents: Option<String>,
+        log_revert_chance: f64,
+        // Addition
+        // role is optional only to handle an inconsistent database. it should always be set
+        role: Option<&'a Role>,
+    }
+
+    let uks: Vec<ReturnType> = rpc_key::Entity::find()
         .filter(rpc_key::Column::UserId.eq(user.id))
         .all(db_replica.as_ref())
         .await
-        .web3_context("failed loading user's key")?;
+        .web3_context("failed loading user's key")?
+        .into_iter()
+        .map(|x| ReturnType {
+            id: x.id,
+            user_id: x.user_id,
+            secret_key: x.secret_key.into(),
+            description: x.description,
+            private_txs: x.private_txs,
+            active: x.active,
+            allowed_ips: x.allowed_ips,
+            allowed_origins: x.allowed_origins,
+            allowed_referers: x.allowed_referers,
+            allowed_user_agents: x.allowed_user_agents,
+            log_revert_chance: x.log_revert_chance,
+            role: Some(&Role::Owner),
+        })
+        .collect::<Vec<_>>();
 
     let secondary_user_entities = secondary_user::Entity::find()
         .filter(secondary_user::Column::UserId.eq(user.id))
@@ -50,25 +84,36 @@ pub async fn rpc_keys_get(
         .collect::<HashMap<u64, secondary_user::Model>>();
 
     // Now return a list of all subusers (their wallets)
-    let rpc_key_entities: Vec<rpc_key::Model> = rpc_key::Entity::find()
+    let secondary_rpc_key_entities: Vec<ReturnType> = rpc_key::Entity::find()
         .filter(
-            rpc_key::Column::Id.is_in(
-                secondary_user_entities
-                    .iter()
-                    .map(|(x, _)| *x)
-                    .collect::<Vec<_>>(),
-            ),
+            rpc_key::Column::Id.is_in(secondary_user_entities.keys().copied().collect::<Vec<_>>()),
         )
         .all(db_replica.as_ref())
-        .await?;
+        .await?
+        .into_iter()
+        .map(|x| ReturnType {
+            id: x.id,
+            user_id: x.user_id,
+            secret_key: x.secret_key.into(),
+            description: x.description,
+            private_txs: x.private_txs,
+            active: x.active,
+            allowed_ips: x.allowed_ips,
+            allowed_origins: x.allowed_origins,
+            allowed_referers: x.allowed_referers,
+            allowed_user_agents: x.allowed_user_agents,
+            log_revert_chance: x.log_revert_chance,
+            role: secondary_user_entities.get(&x.id).map(|x| &x.role),
+        })
+        .collect::<Vec<_>>();
 
     let response_json = json!({
         "user_id": user.id,
         "user_rpc_keys": uks
             .into_iter()
             .map(|uk| (uk.id, uk))
-            .chain(rpc_key_entities.into_iter().map(|sk| (sk.id, sk)))
-            .collect::<HashMap::<_, _>>(),
+            .chain(secondary_rpc_key_entities.into_iter().map(|sk| (sk.id, sk)))
+            .collect::<HashMap::<_, _>>()
     });
 
     Ok(Json(response_json).into_response())
@@ -80,10 +125,10 @@ pub async fn rpc_keys_delete(
     Extension(app): Extension<Arc<Web3ProxyApp>>,
     TypedHeader(Authorization(bearer)): TypedHeader<Authorization<Bearer>>,
 ) -> Web3ProxyResponse {
-    let (_user, _semaphore) = app.bearer_is_authorized(bearer).await?;
+    let _user = app.bearer_is_authorized(bearer).await?;
 
     // TODO: think about how cascading deletes and billing should work
-    Err(Web3ProxyError::NotImplemented)
+    Err(Web3ProxyError::NotImplemented("rpc_keys_delete".into()))
 }
 
 /// the JSON input to the `rpc_keys_management` handler.
@@ -100,7 +145,6 @@ pub struct UserKeyManagement {
     allowed_referers: Option<String>,
     allowed_user_agents: Option<String>,
     description: Option<String>,
-    log_level: Option<TrackingLevel>,
     // TODO: enable log_revert_trace: Option<f64>,
     private_txs: Option<bool>,
 }
@@ -114,11 +158,9 @@ pub async fn rpc_keys_management(
 ) -> Web3ProxyResponse {
     // TODO: is there a way we can know if this is a PUT or POST? right now we can modify or create keys with either. though that probably doesn't matter
 
-    let (user, _semaphore) = app.bearer_is_authorized(bearer).await?;
+    let user = app.bearer_is_authorized(bearer).await?;
 
-    let db_replica = app
-        .db_replica()
-        .web3_context("getting db for user's keys")?;
+    let db_replica = app.db_replica()?;
 
     let mut uk = match payload.key_id {
         Some(existing_key_id) => {
@@ -148,10 +190,12 @@ pub async fn rpc_keys_management(
                         {
                             Ok(rpc_key.into_active_model())
                         } else {
-                            Err(Web3ProxyError::AccessDenied)
+                            Err(Web3ProxyError::AccessDenied(
+                                "secondary user is not an admin or owner".into(),
+                            ))
                         }
                     }
-                    Some((x, None)) => Err(Web3ProxyError::BadResponse(
+                    Some((_, None)) => Err(Web3ProxyError::BadResponse(
                         "a subuser record was found, but no corresponding RPC key".into(),
                     )),
                     // Match statement here, check in the user's RPC keys directly if it's not part of the secondary user
@@ -169,14 +213,9 @@ pub async fn rpc_keys_management(
             // TODO: limit to 10 keys?
             let secret_key = RpcSecretKey::new();
 
-            let log_level = payload
-                .log_level
-                .web3_context("log level must be 'none', 'detailed', or 'aggregated'")?;
-
             Ok(rpc_key::ActiveModel {
                 user_id: sea_orm::Set(user.id),
                 secret_key: sea_orm::Set(secret_key.into()),
-                log_level: sea_orm::Set(log_level),
                 ..Default::default()
             })
         }
@@ -301,9 +340,9 @@ pub async fn rpc_keys_management(
     }
 
     let uk = if uk.is_changed() {
-        let db_conn = app.db_conn().web3_context("login requires a db")?;
+        let db_conn = app.db_conn()?;
 
-        uk.save(&db_conn)
+        uk.save(db_conn)
             .await
             .web3_context("Failed saving user key")?
     } else {
