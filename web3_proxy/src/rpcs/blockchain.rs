@@ -435,8 +435,10 @@ impl Web3Rpcs {
                     let rpc_is_backup = rpc.backup;
 
                     // TODO: what timeout on this?
+                    // CHANGES-ryadavDeq: updated timeout to 2 minutes
+                    // TODO-ryadavDeq: make this generic or take from environment variable
                     match timeout(
-                        Duration::from_secs(1),
+                        Duration::from_secs(120),
                         consensus_finder.process_block_from_rpc(self, new_block, rpc),
                     )
                     .await

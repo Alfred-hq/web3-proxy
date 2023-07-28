@@ -166,6 +166,7 @@ impl Web3Rpcs {
 
         let chain_id = app.config.chain_id;
 
+        // INFO: this is polling interval, update it to make sure unnecessary rpc calls are not made or use websocket
         let block_interval = average_block_interval(chain_id);
 
         let mut names_to_keep = vec![];
