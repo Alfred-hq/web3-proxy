@@ -158,7 +158,7 @@ impl ProxydSubCommand {
         }
 
         info!("waiting for head block");
-        let max_wait_until = Instant::now() + Duration::from_secs(35);
+        let max_wait_until = Instant::now() + Duration::from_secs(200);
         loop {
             select! {
                 _ = sleep_until(max_wait_until) => {
