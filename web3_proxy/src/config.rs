@@ -214,20 +214,22 @@ impl Default for AppConfig {
 }
 
 /// TODO: we can't query a provider because we need this to create a provider
+/// CHANGES-ryadavDeq: updated poll interval to two minutes
+/// TODO-ryadavDeq: make this generic or take from environment variable
 pub fn average_block_interval(chain_id: u64) -> Duration {
     match chain_id {
         // ethereum
-        1 => Duration::from_secs(12),
+        1 => Duration::from_secs(12 * 10),
         // ethereum-goerli
-        5 => Duration::from_secs(12),
+        5 => Duration::from_secs(12 * 10),
         // binance
-        56 => Duration::from_secs(3),
+        56 => Duration::from_secs(3 * 40),
         // polygon
-        137 => Duration::from_secs(2),
+        137 => Duration::from_secs(2 * 60),
         // fantom
-        250 => Duration::from_secs(1),
+        250 => Duration::from_secs(1 * 120),
         // arbitrum
-        42161 => Duration::from_millis(500),
+        42161 => Duration::from_millis(500 * 240),
         // anything else
         _ => {
             let default = 10;
