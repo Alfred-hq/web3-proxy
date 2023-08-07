@@ -1,4 +1,4 @@
-FROM debian:bullseye-slim as rust
+FROM debian:bullseye-slim as rust_build
 
 WORKDIR /app
 # sccache cannot cache incrementals, but we use --mount=type=cache and import caches so it should be helpful
@@ -47,22 +47,15 @@ RUN set -eux -o pipefail; \
     bash /tmp/install-binstall.sh; \
     rm -rf /tmp/*
 
-# nextest runs tests in parallel (done its in own FROM so that it can run in parallel)
-# TODO: i'd like to use binaries for these, but i had trouble with arm and binstall
-FROM rust as rust_build
 
 RUN set -eux -o pipefail; \
     \
     cargo binstall -y cargo-nextest
 
-# foundry/anvil are needed to run tests (done its in own FROM so that it can run in parallel)
-FROM rust as rust_foundry
 
 RUN set -eux -o pipefail; \
     \
     curl -L https://foundry.paradigm.xyz | bash && foundryup
-
-FROM rust as rust_with_env
 
 # changing our features doesn't change any of the steps above
 ENV WEB3_PROXY_FEATURES "deadlock_detection,rdkafka-src"
