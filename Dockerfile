@@ -35,9 +35,9 @@ RUN set -eux -o pipefail; \
 # run a cargo command to install our desired version of rust
 # it is expected to exit code 101 since no Cargo.toml exists
 COPY rust-toolchain.toml ./
-RUN set -eux -o pipefail; \
-    \
-    cargo check || [ "$?" -eq 101 ]
+# RUN set -eux -o pipefail; \
+#     \
+#     cargo check || [ "$?" -eq 101 ]
 
 # cargo binstall
 RUN set -eux -o pipefail; \
