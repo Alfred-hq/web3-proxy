@@ -73,10 +73,7 @@ ENV WEB3_PROXY_FEATURES "deadlock_detection,rdkafka-src"
 COPY . .
 
 # fetch deps
-RUN set -eux -o pipefail; \
-    \
-    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
-    cargo --locked --verbose fetch
+RUN cargo --verbose fetch
 
 # build tests (done its in own FROM so that it can run in parallel)
 FROM rust_with_env as build_tests
@@ -85,10 +82,7 @@ COPY --from=rust_foundry /root/.foundry/bin/anvil /root/.foundry/bin/
 COPY --from=rust_nextest /root/.cargo/bin/cargo-nextest* /root/.cargo/bin/
 
 # test the application with cargo-nextest
-RUN set -eux -o pipefail; \
-    \
-    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
-    RUST_LOG=web3_proxy=trace,info \
+RUN RUST_LOG=web3_proxy=trace,info \
     cargo \
     --frozen \
     --offline \
@@ -104,7 +98,6 @@ FROM rust_with_env as build_app
 # TODO: use the "faster_release" profile which builds with `codegen-units = 1` (but compile is SLOW)
 RUN set -eux -o pipefail; \
     \
-    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
     cargo install \
     --features "$WEB3_PROXY_FEATURES" \
     --frozen \
