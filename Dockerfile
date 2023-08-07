@@ -79,6 +79,13 @@ RUN cargo install \
     ; \
     /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
 
+FROM debian:bullseye-slim AS runtime
+
+WORKDIR /app
+
+# we copy something from build_tests just so that docker actually builds it
+COPY --from=rust_build /usr/local/bin/* /usr/local/bin/
+
 # TODO: lower log level when done with prototyping
 ENV RUST_LOG "warn,ethers_providers::rpc=off,web3_proxy=debug,web3_proxy::rpcs::consensus=info,web3_proxy_cli=debug"
 
