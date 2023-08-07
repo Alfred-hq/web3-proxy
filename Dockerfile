@@ -99,18 +99,9 @@ FROM rust_with_env as build_app
 # build the release application
 # using a "release" profile (which install does by default) is **very** important
 # TODO: use the "faster_release" profile which builds with `codegen-units = 1` (but compile is SLOW)
-RUN set -eux -o pipefail; \
-    \
-    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
-    cargo install \
-    --features "$WEB3_PROXY_FEATURES" \
-    --frozen \
-    --no-default-features \
-    --offline \
-    --path ./web3_proxy_cli \
-    --root /usr/local \
-    ; \
-    /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
+RUN cargo build --release
+
+RUN /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
 
 # copy this file so that docker actually creates the build_tests container
 # without this, the runtime container doesn't need build_tests and so docker build skips it
