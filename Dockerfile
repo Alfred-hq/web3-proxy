@@ -103,9 +103,14 @@ RUN cargo build --release
 
 RUN /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
 
+# RUN cargo build --release --frozen
+
 # copy this file so that docker actually creates the build_tests container
 # without this, the runtime container doesn't need build_tests and so docker build skips it
-COPY --from=build_tests /test_success /
+# COPY --from=build_tests /test_success /
+
+FROM ubuntu:latest as ub
+RUN apt-get update && apt-get install -y ca-certificates
 
 #
 # We do not need the Rust toolchain or any deps to run the binary!
@@ -129,6 +134,7 @@ ENV RUST_LOG "warn,ethers_providers::rpc=off,web3_proxy=debug,web3_proxy::rpcs::
 
 # we copy something from build_tests just so that docker actually builds it
 COPY --from=build_app /usr/local/bin/* /usr/local/bin/
+COPY --from=ub /etc/ssl/certs /etc/ssl/certs
 
 # make sure the app works
 RUN web3_proxy_cli --help

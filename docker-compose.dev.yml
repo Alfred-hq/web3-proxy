@@ -1,9 +1,7 @@
 services:
   web3-proxy:
     # TODO: build in dev but use docker hub in prod?
-    build:
-      context: .
-      dockerfile: ./Dockerfile.prod
+    build: .
     volumes:
       - "./config/development.toml:/config/development.toml"
     ports:
