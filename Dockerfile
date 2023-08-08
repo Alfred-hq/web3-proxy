@@ -84,6 +84,8 @@ RUN set -eux -o pipefail; \
 
 # RUN cargo build --release --frozen
 
+# RUN cargo build --release --frozen
+
 # copy this file so that docker actually creates the build_tests container
 # without this, the runtime container doesn't need build_tests and so docker build skips it
 # COPY --from=build_tests /test_success /
