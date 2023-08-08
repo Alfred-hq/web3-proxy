@@ -1,7 +1,8 @@
 FROM debian:bullseye-slim as rust
 
 WORKDIR /app
-# sccache cannot cache incrementals, but we use CARGO_INCREMENTAL true
+# sccache cannot cache incrementals, but we use --mount=type=cache and import caches so it should be helpful
+ENV CARGO_INCREMENTAL true
 ENV CARGO_UNSTABLE_SPARSE_REGISTRY true
 ENV CARGO_TERM_COLOR always
 SHELL [ "/bin/bash", "-c" ]
@@ -10,7 +11,6 @@ ENV PATH "/root/.foundry/bin:/root/.cargo/bin:${PATH}"
 
 # install rustup dependencies
 # also install web3-proxy system dependencies. most things are rust-only, but not everything
-RUN set -eux -o pipefail; \
 RUN set -eux -o pipefail; \
     \
     apt-get update; \
@@ -30,7 +30,6 @@ RUN set -eux -o pipefail; \
 
 # install rustup
 RUN set -eux -o pipefail; \
-RUN set -eux -o pipefail; \
     \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile=minimal
 
@@ -43,67 +42,30 @@ RUN set -eux -o pipefail; \
 
 # cargo binstall
 RUN set -eux -o pipefail; \
-RUN set -eux -o pipefail; \
     \
     curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh >/tmp/install-binstall.sh; \
     bash /tmp/install-binstall.sh; \
     rm -rf /tmp/*
 
-# nextest runs tests in parallel (done its in own FROM so that it can run in parallel)
-# TODO: i'd like to use binaries for these, but i had trouble with arm and binstall
-FROM rust as rust_nextest
-
-RUN set -eux -o pipefail; \
-    \
-    cargo binstall -y cargo-nextest
-
-# foundry/anvil are needed to run tests (done its in own FROM so that it can run in parallel)
-FROM rust as rust_foundry
-
-RUN set -eux -o pipefail; \
-    \
-    curl -L https://foundry.paradigm.xyz | bash && foundryup
-
 FROM rust as rust_with_env
 
 # changing our features doesn't change any of the steps above
-ENV WEB3_PROXY_FEATURES "rdkafka-src"
+ENV WEB3_PROXY_FEATURES "deadlock_detection,rdkafka-src"
 
 # copy the app
 COPY . .
 
 # fetch deps
 RUN set -eux -o pipefail; \
-RUN set -eux -o pipefail; \
     \
     [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
     cargo --locked --verbose fetch
-
-# build tests (done its in own FROM so that it can run in parallel)
-FROM rust_with_env as build_tests
-
-COPY --from=rust_foundry /root/.foundry/bin/anvil /root/.foundry/bin/
-COPY --from=rust_nextest /root/.cargo/bin/cargo-nextest* /root/.cargo/bin/
-
-# test the application with cargo-nextest
-RUN set -eux -o pipefail; \
-    \
-    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
-    RUST_LOG=web3_proxy=trace,info \
-    cargo \
-    --frozen \
-    --offline \
-    nextest run \
-    --features "$WEB3_PROXY_FEATURES" --no-default-features \
-    ; \
-    touch /test_success
 
 FROM rust_with_env as build_app
 
 # build the release application
 # using a "release" profile (which install does by default) is **very** important
 # TODO: use the "faster_release" profile which builds with `codegen-units = 1` (but compile is SLOW)
-RUN cargo build --release
 
 # RUN apt-get update && apt install libssl-dev -y
 
