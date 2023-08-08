@@ -1,7 +1,8 @@
 FROM debian:bullseye-slim as rust
 
 WORKDIR /app
-# sccache cannot cache incrementals, but we use CARGO_INCREMENTAL true
+# sccache cannot cache incrementals, but we use --mount=type=cache and import caches so it should be helpful
+ENV CARGO_INCREMENTAL true
 ENV CARGO_UNSTABLE_SPARSE_REGISTRY true
 ENV CARGO_TERM_COLOR always
 SHELL [ "/bin/bash", "-c" ]
@@ -35,9 +36,9 @@ RUN set -eux -o pipefail; \
 # run a cargo command to install our desired version of rust
 # it is expected to exit code 101 since no Cargo.toml exists
 COPY rust-toolchain.toml ./
-# RUN set -eux -o pipefail; \
-#     \
-#     cargo check || [ "$?" -eq 101 ]
+RUN set -eux -o pipefail; \
+    \
+    cargo check || [ "$?" -eq 101 ]
 
 # cargo binstall
 RUN set -eux -o pipefail; \
@@ -46,25 +47,10 @@ RUN set -eux -o pipefail; \
     bash /tmp/install-binstall.sh; \
     rm -rf /tmp/*
 
-# nextest runs tests in parallel (done its in own FROM so that it can run in parallel)
-# TODO: i'd like to use binaries for these, but i had trouble with arm and binstall
-FROM rust as rust_nextest
-
-RUN set -eux -o pipefail; \
-    \
-    cargo binstall -y cargo-nextest
-
-# foundry/anvil are needed to run tests (done its in own FROM so that it can run in parallel)
-FROM rust as rust_foundry
-
-RUN set -eux -o pipefail; \
-    \
-    curl -L https://foundry.paradigm.xyz | bash && foundryup
-
 FROM rust as rust_with_env
 
 # changing our features doesn't change any of the steps above
-ENV WEB3_PROXY_FEATURES "rdkafka-src"
+ENV WEB3_PROXY_FEATURES "deadlock_detection,rdkafka-src"
 
 # copy the app
 COPY . .
@@ -75,37 +61,35 @@ RUN set -eux -o pipefail; \
     [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
     cargo --locked --verbose fetch
 
-# build tests (done its in own FROM so that it can run in parallel)
-FROM rust_with_env as build_tests
-
-COPY --from=rust_foundry /root/.foundry/bin/anvil /root/.foundry/bin/
-COPY --from=rust_nextest /root/.cargo/bin/cargo-nextest* /root/.cargo/bin/
-
-# test the application with cargo-nextest
-RUN set -eux -o pipefail; \
-    \
-    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
-    RUST_LOG=web3_proxy=trace,info \
-    cargo \
-    --frozen \
-    --offline \
-    nextest run \
-    --features "$WEB3_PROXY_FEATURES" --no-default-features \
-    ; \
-    touch /test_success
-
 FROM rust_with_env as build_app
 
 # build the release application
 # using a "release" profile (which install does by default) is **very** important
 # TODO: use the "faster_release" profile which builds with `codegen-units = 1` (but compile is SLOW)
-RUN cargo build --release
 
-RUN /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
+# RUN apt-get update && apt install libssl-dev -y
+
+RUN set -eux -o pipefail; \
+    \
+    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
+    cargo install \
+    --features "$WEB3_PROXY_FEATURES" \
+    --frozen \
+    --no-default-features \
+    --offline \
+    --path ./web3_proxy \
+    --root /usr/local \
+    ; \
+    /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
+
+# RUN cargo build --release --frozen
 
 # copy this file so that docker actually creates the build_tests container
 # without this, the runtime container doesn't need build_tests and so docker build skips it
-COPY --from=build_tests /test_success /
+# COPY --from=build_tests /test_success /
+
+FROM ubuntu:latest as ub
+RUN apt-get update && apt-get install -y ca-certificates
 
 #
 # We do not need the Rust toolchain or any deps to run the binary!
@@ -129,6 +113,7 @@ ENV RUST_LOG "warn,ethers_providers::rpc=off,web3_proxy=debug,web3_proxy::rpcs::
 
 # we copy something from build_tests just so that docker actually builds it
 COPY --from=build_app /usr/local/bin/* /usr/local/bin/
+COPY --from=ub /etc/ssl/certs /etc/ssl/certs
 
 # make sure the app works
 RUN web3_proxy_cli --help

@@ -436,7 +436,7 @@ impl Web3Rpcs {
 
                     // TODO: what timeout on this?
                     match timeout(
-                        Duration::from_secs(1),
+                        Duration::from_secs(125),
                         consensus_finder.process_block_from_rpc(self, new_block, rpc),
                     )
                     .await
