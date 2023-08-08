@@ -12,7 +12,6 @@ ENV PATH "/root/.foundry/bin:/root/.cargo/bin:${PATH}"
 # install rustup dependencies
 # also install web3-proxy system dependencies. most things are rust-only, but not everything
 RUN set -eux -o pipefail; \
-RUN set -eux -o pipefail; \
     \
     apt-get update; \
     apt-get install --no-install-recommends --yes \
@@ -31,7 +30,6 @@ RUN set -eux -o pipefail; \
 
 # install rustup
 RUN set -eux -o pipefail; \
-RUN set -eux -o pipefail; \
     \
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile=minimal
 
@@ -43,7 +41,6 @@ RUN set -eux -o pipefail; \
     cargo check || [ "$?" -eq 101 ]
 
 # cargo binstall
-RUN set -eux -o pipefail; \
 RUN set -eux -o pipefail; \
     \
     curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh >/tmp/install-binstall.sh; \
@@ -59,7 +56,6 @@ ENV WEB3_PROXY_FEATURES "deadlock_detection,rdkafka-src"
 COPY . .
 
 # fetch deps
-RUN set -eux -o pipefail; \
 RUN set -eux -o pipefail; \
     \
     [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
