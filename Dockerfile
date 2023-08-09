@@ -1,4 +1,4 @@
-FROM debian:bullseye-slim as rust
+FROM debian:bullseye as rust
 
 WORKDIR /app
 # sccache cannot cache incrementals, but we use --mount=type=cache and import caches so it should be helpful
