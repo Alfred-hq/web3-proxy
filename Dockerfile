@@ -96,6 +96,29 @@ RUN apt-get update && apt-get install -y ca-certificates
 #
 FROM debian:bullseye AS runtime
 
+SHELL [ "/bin/bash", "-c" ]
+ENV SHELL /bin/bash
+ENV PATH "/root/.foundry/bin:/root/.cargo/bin:${PATH}"
+
+# install rustup dependencies
+# also install web3-proxy system dependencies. most things are rust-only, but not everything
+RUN set -eux -o pipefail; \
+    \
+    apt-get update; \
+    apt-get install --no-install-recommends --yes \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    git \
+    liblz4-dev \
+    libpthread-stubs0-dev \
+    libsasl2-dev \
+    libzstd-dev \
+    make \
+    pkg-config \
+    ;
+
 # Create llama user to avoid running container with root
 RUN set -eux; \
     \
