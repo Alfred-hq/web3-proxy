@@ -113,7 +113,6 @@ ENV RUST_LOG "warn,ethers_providers::rpc=off,web3_proxy=debug,web3_proxy::rpcs::
 
 # we copy something from build_tests just so that docker actually builds it
 COPY --from=build_app /usr/local/bin/* /usr/local/bin/
-COPY --from=ub /etc/ssl/certs /etc/ssl/certs
 
 # make sure the app works
 RUN web3_proxy_cli --help
