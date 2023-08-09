@@ -94,7 +94,7 @@ RUN apt-get update && apt-get install -y ca-certificates
 #
 # We do not need the Rust toolchain or any deps to run the binary!
 #
-FROM debian:bullseye-slim AS runtime
+FROM debian:bullseye AS runtime
 
 # Create llama user to avoid running container with root
 RUN set -eux; \
