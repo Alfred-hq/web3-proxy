@@ -88,8 +88,8 @@ RUN set -eux -o pipefail; \
 # without this, the runtime container doesn't need build_tests and so docker build skips it
 # COPY --from=build_tests /test_success /
 
-FROM ubuntu:latest as ub
-RUN apt-get update && apt-get install -y ca-certificates
+# FROM ubuntu:latest as ub
+# RUN apt-get update && apt-get install -y ca-certificates
 
 #
 # We do not need the Rust toolchain or any deps to run the binary!
