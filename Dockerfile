@@ -1,4 +1,4 @@
-FROM debian:bullseye as rust
+FROM ubuntu as rust
 
 WORKDIR /app
 # sccache cannot cache incrementals, but we use --mount=type=cache and import caches so it should be helpful
@@ -94,7 +94,7 @@ RUN set -eux -o pipefail; \
 #
 # We do not need the Rust toolchain or any deps to run the binary!
 #
-FROM debian:bullseye AS runtime
+FROM ubuntu AS runtime
 
 SHELL [ "/bin/bash", "-c" ]
 ENV SHELL /bin/bash
