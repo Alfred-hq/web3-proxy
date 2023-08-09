@@ -219,17 +219,17 @@ impl Default for AppConfig {
 pub fn average_block_interval(chain_id: u64) -> Duration {
     match chain_id {
         // ethereum
-        1 => Duration::from_secs(12 * 10),
+        1 => Duration::from_secs(60),
         // ethereum-goerli
-        5 => Duration::from_secs(12 * 10),
+        5 => Duration::from_secs(60),
         // binance
-        56 => Duration::from_secs(3 * 40),
+        56 => Duration::from_secs(60),
         // polygon
-        137 => Duration::from_secs(2 * 60),
+        137 => Duration::from_secs(60),
         // fantom
-        250 => Duration::from_secs(1 * 120),
+        250 => Duration::from_secs(60),
         // arbitrum
-        42161 => Duration::from_millis(500 * 240),
+        42161 => Duration::from_millis(500 * 120),
         // anything else
         _ => {
             let default = 10;
