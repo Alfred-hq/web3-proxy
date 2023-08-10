@@ -94,6 +94,10 @@ RUN set -eux -o pipefail; \
 #
 # We do not need the Rust toolchain or any deps to run the binary!
 #
+
+FROM ubuntu:latest as ub
+RUN apt-get update && apt-get install -y ca-certificates
+
 FROM ubuntu AS runtime
 
 SHELL [ "/bin/bash", "-c" ]
@@ -136,6 +140,7 @@ ENV RUST_LOG "warn,ethers_providers::rpc=off,web3_proxy=debug,web3_proxy::rpcs::
 
 # we copy something from build_tests just so that docker actually builds it
 COPY --from=build_app /usr/local/bin/* /usr/local/bin/
+COPY --from=ub /etc/ssl/certs /etc/ssl/certs
 
 # make sure the app works
 RUN web3_proxy_cli --help
