@@ -45,4 +45,4 @@ jobs:
         with:
           push: true
           tags: ${{ env.REGISTRY_IMAGE }}:latest, ${{ env.REGISTRY_IMAGE }}:${{ github.sha }}
-          project: d6hfj9jrxv
+          project: bn1smdg9q2
