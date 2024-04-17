@@ -184,7 +184,8 @@ RUN --mount=type=cache,target=/root/.cargo/git \
     set -eux -o pipefail; \
     \
     [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
-    cargo install \
+    cargo build \
+    --target $(rustc -Vv | grep host | cut -d ' ' -f2) \
     --features "$WEB3_PROXY_FEATURES" \
     --frozen \
     --offline \
