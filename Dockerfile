@@ -189,9 +189,8 @@ RUN --mount=type=cache,target=/root/.cargo/git \
     --frozen \
     --offline \
     --no-default-features \
-    --root /usr/local \
-    ; \
-    /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
+
+RUN /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
 
 # copy this file so that docker actually creates the build_tests container
 # without this, the runtime container doesn't need build_tests and so docker build skips it
