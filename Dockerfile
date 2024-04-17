@@ -60,6 +60,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 # it is expected to exit code 101 since no Cargo.toml exists
 # the rm is there because `cargo clean` can't run without a Cargo.toml, but a new version of rust likely needs a clean target dir
 COPY rust-toolchain.toml ./
+COPY Cargo.toml ./
 RUN cargo check || [ "$?" -eq 101 ]; \
     [ -e /app/target/rust-toolchain.toml ] && [ "$(cat /app/target/rust-toolchain.toml)" != "$(cat ./rust-toolchain.toml)" ] && rm -rf /app/target/*; \
     [ -e /app/target_test/rust-toolchain.toml ] && [ "$(cat /app/target_test/rust-toolchain.toml)" != "$(cat ./rust-toolchain.toml)" ] && rm -rf /app/target_test/*; \
