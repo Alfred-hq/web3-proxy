@@ -66,7 +66,7 @@ RUN --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/root/.cargo/registry \
     set -eux -o pipefail; \
     \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile=minimal
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 # run a cargo command to install our desired version of rust
 # it is expected to exit code 101 since no Cargo.toml exists
@@ -175,6 +175,8 @@ RUN --mount=type=cache,target=/root/.cargo/git \
 
 FROM rust_with_env as build_app
 
+RUN rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu 
+
 # build the release application
 # using a "release" profile (which install does by default) is **very** important
 # TODO: use the "faster_release" profile which builds with `codegen-units = 1` (but compile is SLOW)
@@ -185,6 +187,7 @@ RUN --mount=type=cache,target=/root/.cargo/git \
     \
     [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
     cargo build \
+    --target $(rustc --print target-list | grep -E "(aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu)" | head -n1 | awk '{print $1}') \
     --features "$WEB3_PROXY_FEATURES" \
     --frozen \
     --offline \
