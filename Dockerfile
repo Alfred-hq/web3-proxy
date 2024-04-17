@@ -187,10 +187,10 @@ RUN --mount=type=cache,target=/root/.cargo/git \
     cargo build \
     --features "$WEB3_PROXY_FEATURES" \
     --frozen \
-    --offline
-    # --release
+    --offline \
+    --release
 
-RUN --mount=type=cache,target=/app/target cp /app/target/debug/web3_proxy_cli /usr/local/bin/web3_proxy_cli
+RUN --mount=type=cache,target=/app/target cp /app/target/release/web3_proxy_cli /usr/local/bin/web3_proxy_cli
 
 RUN /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
 
