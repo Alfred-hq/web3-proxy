@@ -187,7 +187,7 @@ RUN --mount=type=cache,target=/root/.cargo/git \
     \
     [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
     cargo build \
-    --target $(rustc --print target-list | grep -E "(aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu)" | head -n1 | awk '{print $1}') \
+    --target "x86_64-unknown-linux-gnu" \
     --features "$WEB3_PROXY_FEATURES" \
     --frozen \
     --offline \
