@@ -190,6 +190,8 @@ RUN --mount=type=cache,target=/root/.cargo/git \
     --offline \
     --release
 
+RUN cp /app/target/release/web3_proxy_cli /usr/local/bin/web3_proxy_cli
+
 RUN /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
 
 # copy this file so that docker actually creates the build_tests container
