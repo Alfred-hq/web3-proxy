@@ -188,7 +188,7 @@ RUN --mount=type=cache,target=/root/.cargo/git \
     --features "$WEB3_PROXY_FEATURES" \
     --frozen \
     --offline \
-    --no-default-features \
+    --no-default-features
 
 RUN /usr/local/bin/web3_proxy_cli --help | grep 'Usage: web3_proxy_cli'
 
