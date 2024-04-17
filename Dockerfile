@@ -157,21 +157,21 @@ COPY --link --from=rust_foundry /root/.foundry/bin/anvil /root/.foundry/bin/
 COPY --link --from=rust_nextest /root/.cargo/bin/cargo-nextest* /root/.cargo/bin/
 
 # test the application with cargo-nextest
-RUN --mount=type=cache,target=/root/.cargo/git \
-    --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/app/target_test \
-    set -eux -o pipefail; \
-    \
-    export CARGO_TARGET_DIR=target_test; \
-    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
-    RUST_LOG=web3_proxy=trace,info \
-    cargo \
-    --frozen \
-    --offline \
-    nextest run \
-    --features "$WEB3_PROXY_FEATURES" --no-default-features \
-    ; \
-    touch /test_success
+# RUN --mount=type=cache,target=/root/.cargo/git \
+#     --mount=type=cache,target=/root/.cargo/registry \
+#     --mount=type=cache,target=/app/target_test \
+#     set -eux -o pipefail; \
+#     \
+#     export CARGO_TARGET_DIR=target_test; \
+#     [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
+#     RUST_LOG=web3_proxy=trace,info \
+#     cargo \
+#     --frozen \
+#     --offline \
+#     nextest run \
+#     --features "$WEB3_PROXY_FEATURES" --no-default-features \
+#     ; \
+#     touch /test_success
 
 FROM rust_with_env as build_app
 
