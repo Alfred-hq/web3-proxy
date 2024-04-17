@@ -3,7 +3,11 @@ FROM debian:bullseye-slim as mold
 ENV SHELL /bin/bash
 SHELL [ "/bin/bash", "-c" ]
 
-RUN apt-get update; \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    set -eux -o pipefail; \
+    \
+    apt-get update; \
     apt-get install --no-install-recommends --yes \
     ca-certificates \
     git \
@@ -37,7 +41,11 @@ SHELL [ "/bin/bash", "-c" ]
 # install rustup dependencies
 # install clang for mold
 # also install web3-proxy system dependencies. most things are rust-only, but not everything
-RUN apt-get update; \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    set -eux -o pipefail; \
+    \
+    apt-get update; \
     apt-get install --no-install-recommends --yes \
     build-essential \
     ca-certificates \
@@ -54,14 +62,23 @@ RUN apt-get update; \
     ;
 
 # install rustup
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile=minimal
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    set -eux -o pipefail; \
+    \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile=minimal
 
 # run a cargo command to install our desired version of rust
 # it is expected to exit code 101 since no Cargo.toml exists
 # the rm is there because `cargo clean` can't run without a Cargo.toml, but a new version of rust likely needs a clean target dir
 COPY rust-toolchain.toml ./
-COPY Cargo.toml ./
-RUN cargo check || [ "$?" -eq 101 ]; \
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/app/target \
+    --mount=type=cache,target=/app/target_test \
+    set -eux -o pipefail; \
+    \
+    cargo check || [ "$?" -eq 101 ]; \
     [ -e /app/target/rust-toolchain.toml ] && [ "$(cat /app/target/rust-toolchain.toml)" != "$(cat ./rust-toolchain.toml)" ] && rm -rf /app/target/*; \
     [ -e /app/target_test/rust-toolchain.toml ] && [ "$(cat /app/target_test/rust-toolchain.toml)" != "$(cat ./rust-toolchain.toml)" ] && rm -rf /app/target_test/*; \
     cp ./rust-toolchain.toml /app/target/rust-toolchain.toml; \
@@ -72,14 +89,22 @@ COPY --link --from=mold /usr/local/bin/mold /usr/local/bin/mold
 COPY --link --from=mold /root/.cargo/config.toml /root/.cargo/config.toml
 
 # cargo binstall makes it fast to install binaries
-RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh >/tmp/install-binstall.sh; \
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    set -eux -o pipefail; \
+    \
+    curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh >/tmp/install-binstall.sh; \
     bash /tmp/install-binstall.sh; \
     rm -rf /tmp/*
 
 # flamegraph/tokio-console are used for debugging
 FROM rust as rust_flamegraph
 
-RUN cargo binstall -y flamegraph
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    set -eux -o pipefail; \
+    \
+    cargo binstall -y flamegraph
 
 # FROM rust as rust_tokio_console
 # RUN --mount=type=cache,target=/root/.cargo/git \
@@ -92,12 +117,20 @@ RUN cargo binstall -y flamegraph
 # TODO: i'd like to use binaries for these, but i had trouble with arm and binstall
 FROM rust as rust_nextest
 
-# RUN cargo binstall -y cargo-nextest
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    set -eux -o pipefail; \
+    \
+    cargo binstall -y cargo-nextest
 
 # foundry/anvil are needed to run tests (done its in own FROM so that it can run in parallel)
 FROM rust as rust_foundry
 
-RUN curl -L https://foundry.paradigm.xyz | bash && foundryup
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    set -eux -o pipefail; \
+    \
+    curl -L https://foundry.paradigm.xyz | bash && foundryup
 
 FROM rust as rust_with_env
 
@@ -110,7 +143,11 @@ COPY . .
 
 # fill the package caches
 # TODO: clean needed because of rust upgrade and jenkins caches :'(
-RUN [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    set -eux -o pipefail; \
+    \
+    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
     cargo --locked fetch
 
 # build tests (done its in own FROM so that it can run in parallel)
@@ -120,28 +157,33 @@ COPY --link --from=rust_foundry /root/.foundry/bin/anvil /root/.foundry/bin/
 COPY --link --from=rust_nextest /root/.cargo/bin/cargo-nextest* /root/.cargo/bin/
 
 # test the application with cargo-nextest
-# RUN --mount=type=cache,target=/root/.cargo/git \
-#     --mount=type=cache,target=/root/.cargo/registry \
-#     --mount=type=cache,target=/app/target_test \
-#     set -eux -o pipefail; \
-#     \
-#     export CARGO_TARGET_DIR=target_test; \
-#     [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
-#     RUST_LOG=web3_proxy=trace,info \
-#     cargo \
-#     --frozen \
-#     --offline \
-#     nextest run \
-#     --features "$WEB3_PROXY_FEATURES" --no-default-features \
-#     ; \
-#     touch /test_success
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/app/target_test \
+    set -eux -o pipefail; \
+    \
+    export CARGO_TARGET_DIR=target_test; \
+    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
+    RUST_LOG=web3_proxy=trace,info \
+    cargo \
+    --frozen \
+    --offline \
+    nextest run \
+    --features "$WEB3_PROXY_FEATURES" --no-default-features \
+    ; \
+    touch /test_success
 
 FROM rust_with_env as build_app
 
 # build the release application
 # using a "release" profile (which install does by default) is **very** important
 # TODO: use the "faster_release" profile which builds with `codegen-units = 1` (but compile is SLOW)
-RUN [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
+RUN --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/app/target \
+    set -eux -o pipefail; \
+    \
+    [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/payment-contracts/build.rs"; \
     cargo install \
     --features "$WEB3_PROXY_FEATURES" \
     --frozen \
@@ -154,7 +196,7 @@ RUN [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/paym
 
 # copy this file so that docker actually creates the build_tests container
 # without this, the runtime container doesn't need build_tests and so docker build skips it
-# COPY --link --from=build_tests /test_success /
+COPY --link --from=build_tests /test_success /
 
 #
 # We do not need the Rust toolchain or any deps to run the binary!
@@ -162,7 +204,9 @@ RUN [ -e "$(pwd)/payment-contracts/src/contracts/mod.rs" ] || touch "$(pwd)/paym
 FROM debian:bullseye-slim AS runtime
 
 # Create llama user to avoid running container with root
-RUN mkdir /llama; \
+RUN set -eux; \
+    \
+    mkdir /llama; \
     adduser --home /llama --shell /sbin/nologin --gecos '' --no-create-home --disabled-password --uid 1001 llama; \
     chown -R llama /llama
 
