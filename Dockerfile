@@ -203,6 +203,8 @@ COPY --link --from=build_tests /test_success /
 #
 FROM debian:bullseye-slim AS runtime
 
+RUN apt-get update && apt-get install -y curl
+
 # Create llama user to avoid running container with root
 RUN set -eux; \
     \
