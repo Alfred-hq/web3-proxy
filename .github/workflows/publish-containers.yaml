@@ -3,6 +3,7 @@ on:
     branches:    
       - production
       - development
+      - feat/polling-fix
 
 env:
   REGISTRY_IMAGE: alfredcapital/web3-proxy

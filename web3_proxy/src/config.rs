@@ -298,27 +298,27 @@ impl AppConfig {
 pub fn average_block_interval(chain_id: u64) -> Duration {
     match chain_id {
         // ethereum
-        1 => Duration::from_secs(12),
+        1 => Duration::from_secs(12 * 10),
         // ethereum-goerli
-        5 => Duration::from_secs(12),
+        5 => Duration::from_secs(12 * 10),
         // optimism
-        10 => Duration::from_secs(2),
+        10 => Duration::from_secs(2 * 40),
         // binance
-        56 => Duration::from_secs(3),
+        56 => Duration::from_secs(3 * 40),
         // polygon
-        137 => Duration::from_secs(2),
+        137 => Duration::from_secs(2 * 60),
         // fantom
-        250 => Duration::from_secs(1),
+        250 => Duration::from_secs(1 * 120),
         // zkevm polygon
-        1101 => Duration::from_secs(7),
+        1101 => Duration::from_secs(7 * 25),
         // base
-        8453 => Duration::from_secs(2),
+        8453 => Duration::from_secs(2 * 60),
         // development
-        31337 => Duration::from_secs(10),
+        31337 => Duration::from_secs(10 * 12),
         // arbitrum
-        42161 => Duration::from_millis(500),
+        42161 => Duration::from_millis(500 * 240),
         // web3-proxy tests
-        999_001_999 => Duration::from_secs(10),
+        999_001_999 => Duration::from_secs(10 * 12),
         // anything else
         _ => {
             let default = 10;
